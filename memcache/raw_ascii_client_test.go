@@ -1,29 +1,75 @@
 package memcache
 
 import (
+	"context"
+	"fmt"
+	"time"
+
 	. "gopkg.in/check.v1"
 
 	. "github.com/dropbox/godropbox/gocheck2"
 )
 
-type RawAsciiClientSuite struct {
-	rw     *mockReadWriter
-	client *RawAsciiClient
+// ContextRawAsciiClientSuite is a parameterized test suite. We want to share test methods
+// for both the context-aware and non-context-aware clients. `check` names suites after their
+// types, so we'll define methods on the base, and create subtypes for each instantiation.
+type baseAsciiClientSuite struct {
+	contextAware bool
+	rw           *mockReadWriter
+	client       ContextClientShard
 }
 
-var _ = Suite(&RawAsciiClientSuite{})
+type contextRawAsciiClientSuite struct {
+	baseAsciiClientSuite
+}
 
-func (s *RawAsciiClientSuite) SetUpTest(c *C) {
+var _ = Suite(&contextRawAsciiClientSuite{})
+
+func (s *contextRawAsciiClientSuite) SetUpTest(c *C) {
+	s.contextAware = true
 	s.rw = newMockReadWriter()
-	s.client = NewRawAsciiClient(0, s.rw).(*RawAsciiClient)
+	s.client = NewContextRawAsciiClient(0, s.rw)
 }
 
-func (s *RawAsciiClientSuite) TestGet(c *C) {
+type rawAsciiClientSuite struct {
+	baseAsciiClientSuite
+}
+
+var _ = Suite(&rawAsciiClientSuite{})
+
+func (s *rawAsciiClientSuite) SetUpTest(c *C) {
+	s.contextAware = false
+	s.rw = newMockReadWriter()
+	// NB: We'll trust that the adapter properly drops the 'context' parameter and calls
+	// the underlying method on the raw ascii client.
+	s.client = newIgnoreContextClientShardAdapter(NewRawAsciiClient(0, s.rw))
+}
+
+func (s *baseAsciiClientSuite) verifyContextAwareDeadline(ctx context.Context) error {
+	if d, ok := ctx.Deadline(); ok && s.contextAware {
+		if s.rw.deadline.IsZero() {
+			return fmt.Errorf("conn timeout is default; want %s", time.Until(d))
+		}
+		if s.rw.deadline != d {
+			return fmt.Errorf("conn timeout = %s; want <= %s", time.Until(s.rw.deadline), time.Until(d))
+		}
+	} else {
+		if !s.rw.deadline.IsZero() {
+			return fmt.Errorf("conn timeout = %s; want default", time.Until(s.rw.deadline))
+		}
+	}
+	return nil
+}
+
+func (s *baseAsciiClientSuite) TestGet(c *C) {
+	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
+	defer cancel()
+
 	s.rw.recvBuf.WriteString("VALUE key 333 4 12345\r\nitem\r\n")
 	s.rw.recvBuf.WriteString("VALUE key2 42 6 14\r\nAB\r\nCD\r\n")
 	s.rw.recvBuf.WriteString("END\r\n")
 
-	responses := s.client.GetMulti([]string{"key2", "key"})
+	responses := s.client.GetMulti(ctx, []string{"key2", "key"})
 
 	c.Assert(s.rw.sendBuf.String(), Equals, "gets key2 key\r\n")
 	c.Assert(s.client.IsValidState(), IsTrue)
@@ -47,12 +93,18 @@ func (s *RawAsciiClientSuite) TestGet(c *C) {
 	c.Assert(resp.Value(), DeepEquals, []byte("AB\r\nCD"))
 	c.Assert(resp.Flags(), Equals, uint32(42))
 	c.Assert(resp.DataVersionId(), Equals, uint64(14))
+	if err := s.verifyContextAwareDeadline(ctx); err != nil {
+		c.Error(err)
+	}
 }
 
-func (s *RawAsciiClientSuite) TestGetNotFound(c *C) {
+func (s *baseAsciiClientSuite) TestGetNotFound(c *C) {
+	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
+	defer cancel()
+
 	s.rw.recvBuf.WriteString("END\r\n")
 
-	resp := s.client.Get("key")
+	resp := s.client.Get(ctx, "key")
 
 	c.Assert(s.rw.sendBuf.String(), Equals, "gets key\r\n")
 	c.Assert(s.client.IsValidState(), IsTrue)
@@ -63,30 +115,46 @@ func (s *RawAsciiClientSuite) TestGetNotFound(c *C) {
 	c.Assert(resp.Value(), IsNil)
 	c.Assert(resp.Flags(), Equals, uint32(0))
 	c.Assert(resp.DataVersionId(), Equals, uint64(0))
+	if err := s.verifyContextAwareDeadline(ctx); err != nil {
+		c.Error(err)
+	}
 }
 
-func (s *RawAsciiClientSuite) TestGetDupKeys(c *C) {
+func (s *baseAsciiClientSuite) TestGetDupKeys(c *C) {
+	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
+	defer cancel()
+
 	s.rw.recvBuf.WriteString("END\r\n")
 
-	_ = s.client.GetMulti([]string{"key", "key", "key2", "key"})
+	_ = s.client.GetMulti(ctx, []string{"key", "key", "key2", "key"})
 
 	c.Assert(s.rw.sendBuf.String(), Equals, "gets key key2\r\n")
 	c.Assert(s.client.IsValidState(), IsTrue)
+	if err := s.verifyContextAwareDeadline(ctx); err != nil {
+		c.Error(err)
+	}
 }
 
-func (s *RawAsciiClientSuite) TestGetBadKey(c *C) {
-	resp := s.client.Get("b a d")
+func (s *baseAsciiClientSuite) TestGetBadKey(c *C) {
+	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
+	defer cancel()
+
+	resp := s.client.Get(ctx, "b a d")
 
 	c.Assert(s.rw.sendBuf.String(), Equals, "")
 	c.Assert(s.client.IsValidState(), IsTrue)
 
 	c.Assert(resp.Error(), NotNil)
+	c.Assert(s.rw.deadline, Equals, time.Time{}, Commentf("Deadline should be unset"))
 }
 
-func (s *RawAsciiClientSuite) TestGetErrorMidStream(c *C) {
+func (s *baseAsciiClientSuite) TestGetErrorMidStream(c *C) {
+	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
+	defer cancel()
+
 	s.rw.recvBuf.WriteString("VALUE key 333 100 12345\r\nunexpected eof ...")
 
-	responses := s.client.GetMulti([]string{"key2", "key"})
+	responses := s.client.GetMulti(ctx, []string{"key2", "key"})
 
 	c.Assert(s.rw.sendBuf.String(), Equals, "gets key2 key\r\n")
 	c.Assert(s.client.IsValidState(), IsFalse)
@@ -100,13 +168,19 @@ func (s *RawAsciiClientSuite) TestGetErrorMidStream(c *C) {
 	resp, ok = responses["key2"]
 	c.Assert(ok, IsTrue)
 	c.Assert(resp.Error(), NotNil)
+	if err := s.verifyContextAwareDeadline(ctx); err != nil {
+		c.Error(err)
+	}
 }
 
-func (s *RawAsciiClientSuite) TestGetCheckEmptyBuffers(c *C) {
+func (s *baseAsciiClientSuite) TestGetCheckEmptyBuffers(c *C) {
+	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
+	defer cancel()
+
 	s.rw.recvBuf.WriteString("VALUE key 1 4 2\r\nitem\r\n")
 	s.rw.recvBuf.WriteString("END\r\nextra stuff")
 
-	resp := s.client.Get("key")
+	resp := s.client.Get(ctx, "key")
 
 	c.Assert(s.client.IsValidState(), IsFalse)
 
@@ -114,9 +188,15 @@ func (s *RawAsciiClientSuite) TestGetCheckEmptyBuffers(c *C) {
 	c.Assert(resp.Status(), Equals, StatusNoError)
 	c.Assert(resp.Key(), Equals, "key")
 	c.Assert(resp.Value(), DeepEquals, []byte("item"))
+	if err := s.verifyContextAwareDeadline(ctx); err != nil {
+		c.Error(err)
+	}
 }
 
-func (s *RawAsciiClientSuite) TestSet(c *C) {
+func (s *baseAsciiClientSuite) TestSet(c *C) {
+	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
+	defer cancel()
+
 	s.rw.recvBuf.WriteString("STORED\r\nSTORED\r\nSTORED\r\n")
 
 	// item1 uses set because cas id is 0
@@ -146,7 +226,7 @@ func (s *RawAsciiClientSuite) TestSet(c *C) {
 		Expiration:    4,
 	}
 
-	responses := s.client.SetMulti([]*Item{item1, item2, item3})
+	responses := s.client.SetMulti(ctx, []*Item{item1, item2, item3})
 
 	c.Assert(
 		s.rw.sendBuf.String(),
@@ -161,15 +241,25 @@ func (s *RawAsciiClientSuite) TestSet(c *C) {
 		c.Assert(resp.Error(), IsNil)
 		c.Assert(resp.Status(), Equals, StatusNoError)
 	}
+	if err := s.verifyContextAwareDeadline(ctx); err != nil {
+		c.Error(err)
+	}
 }
 
-func (s *RawAsciiClientSuite) TestSetNilItem(c *C) {
-	resp := s.client.Set(nil)
+func (s *baseAsciiClientSuite) TestSetNilItem(c *C) {
+	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
+	defer cancel()
+
+	resp := s.client.Set(ctx, nil)
 
 	c.Assert(resp.Error(), NotNil)
+	c.Assert(s.rw.deadline, Equals, time.Time{}, Commentf("Deadline should be unset"))
 }
 
-func (s *RawAsciiClientSuite) TestSetBadKey(c *C) {
+func (s *baseAsciiClientSuite) TestSetBadKey(c *C) {
+	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
+	defer cancel()
+
 	item := &Item{
 		Key:           "b a d",
 		Value:         []byte("item1"),
@@ -178,15 +268,19 @@ func (s *RawAsciiClientSuite) TestSetBadKey(c *C) {
 		Expiration:    555,
 	}
 
-	resp := s.client.Set(item)
+	resp := s.client.Set(ctx, item)
 
 	c.Assert(s.rw.sendBuf.String(), Equals, "")
 	c.Assert(s.client.IsValidState(), IsTrue)
 
 	c.Assert(resp.Error(), NotNil)
+	c.Assert(s.rw.deadline, Equals, time.Time{}, Commentf("Deadline should be unset"))
 }
 
-func (s *RawAsciiClientSuite) TestSetBadValue(c *C) {
+func (s *baseAsciiClientSuite) TestSetBadValue(c *C) {
+	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
+	defer cancel()
+
 	item := &Item{
 		Key:           "key",
 		Value:         make([]byte, defaultMaxValueLength+1),
@@ -195,15 +289,19 @@ func (s *RawAsciiClientSuite) TestSetBadValue(c *C) {
 		Expiration:    555,
 	}
 
-	resp := s.client.Set(item)
+	resp := s.client.Set(ctx, item)
 
 	c.Assert(s.rw.sendBuf.String(), Equals, "")
 	c.Assert(s.client.IsValidState(), IsTrue)
 
 	c.Assert(resp.Error(), NotNil)
+	c.Assert(s.rw.deadline, Equals, time.Time{}, Commentf("Deadline should be unset"))
 }
 
-func (s *RawAsciiClientSuite) TestStoreNotFound(c *C) {
+func (s *baseAsciiClientSuite) TestStoreNotFound(c *C) {
+	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
+	defer cancel()
+
 	s.rw.recvBuf.WriteString("NOT_FOUND\r\n")
 
 	item := &Item{
@@ -214,7 +312,7 @@ func (s *RawAsciiClientSuite) TestStoreNotFound(c *C) {
 		Expiration:    555,
 	}
 
-	resp := s.client.Set(item)
+	resp := s.client.Set(ctx, item)
 	c.Assert(s.client.IsValidState(), IsTrue)
 
 	c.Assert(
@@ -224,9 +322,15 @@ func (s *RawAsciiClientSuite) TestStoreNotFound(c *C) {
 
 	c.Assert(resp.Error(), NotNil)
 	c.Assert(resp.Status(), Equals, StatusKeyNotFound)
+	if err := s.verifyContextAwareDeadline(ctx); err != nil {
+		c.Error(err)
+	}
 }
 
-func (s *RawAsciiClientSuite) TestStoreItemNotStore(c *C) {
+func (s *baseAsciiClientSuite) TestStoreItemNotStore(c *C) {
+	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
+	defer cancel()
+
 	s.rw.recvBuf.WriteString("NOT_STORED\r\n")
 
 	item := &Item{
@@ -237,7 +341,7 @@ func (s *RawAsciiClientSuite) TestStoreItemNotStore(c *C) {
 		Expiration:    555,
 	}
 
-	resp := s.client.Add(item)
+	resp := s.client.Add(ctx, item)
 	c.Assert(s.client.IsValidState(), IsTrue)
 
 	c.Assert(
@@ -247,9 +351,15 @@ func (s *RawAsciiClientSuite) TestStoreItemNotStore(c *C) {
 
 	c.Assert(resp.Error(), NotNil)
 	c.Assert(resp.Status(), Equals, StatusItemNotStored)
+	if err := s.verifyContextAwareDeadline(ctx); err != nil {
+		c.Error(err)
+	}
 }
 
-func (s *RawAsciiClientSuite) TestStoreKeyExists(c *C) {
+func (s *baseAsciiClientSuite) TestStoreKeyExists(c *C) {
+	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
+	defer cancel()
+
 	s.rw.recvBuf.WriteString("EXISTS\r\n")
 
 	item := &Item{
@@ -260,7 +370,7 @@ func (s *RawAsciiClientSuite) TestStoreKeyExists(c *C) {
 		Expiration:    555,
 	}
 
-	resp := s.client.Set(item)
+	resp := s.client.Set(ctx, item)
 	c.Assert(s.client.IsValidState(), IsTrue)
 
 	c.Assert(
@@ -270,9 +380,15 @@ func (s *RawAsciiClientSuite) TestStoreKeyExists(c *C) {
 
 	c.Assert(resp.Error(), NotNil)
 	c.Assert(resp.Status(), Equals, StatusKeyExists)
+	if err := s.verifyContextAwareDeadline(ctx); err != nil {
+		c.Error(err)
+	}
 }
 
-func (s *RawAsciiClientSuite) TestStoreError(c *C) {
+func (s *baseAsciiClientSuite) TestStoreError(c *C) {
+	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
+	defer cancel()
+
 	s.rw.recvBuf.WriteString("SERVER_ERROR\r\n")
 
 	item := &Item{
@@ -283,7 +399,7 @@ func (s *RawAsciiClientSuite) TestStoreError(c *C) {
 		Expiration:    555,
 	}
 
-	resp := s.client.Set(item)
+	resp := s.client.Set(ctx, item)
 	c.Assert(s.client.IsValidState(), IsTrue)
 
 	c.Assert(
@@ -292,9 +408,15 @@ func (s *RawAsciiClientSuite) TestStoreError(c *C) {
 		"cas key 123 555 4 666\r\nitem\r\n")
 
 	c.Assert(resp.Error(), NotNil)
+	if err := s.verifyContextAwareDeadline(ctx); err != nil {
+		c.Error(err)
+	}
 }
 
-func (s *RawAsciiClientSuite) TestStoreErrorMidStream(c *C) {
+func (s *baseAsciiClientSuite) TestStoreErrorMidStream(c *C) {
+	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
+	defer cancel()
+
 	s.rw.recvBuf.WriteString("STORED\r\nSTO") // unexpected eof
 
 	item1 := &Item{
@@ -321,7 +443,7 @@ func (s *RawAsciiClientSuite) TestStoreErrorMidStream(c *C) {
 		Expiration:    4,
 	}
 
-	responses := s.client.SetMulti([]*Item{item1, item2, item3})
+	responses := s.client.SetMulti(ctx, []*Item{item1, item2, item3})
 
 	c.Assert(
 		s.rw.sendBuf.String(),
@@ -335,9 +457,15 @@ func (s *RawAsciiClientSuite) TestStoreErrorMidStream(c *C) {
 	c.Assert(responses[0].Error(), IsNil)
 	c.Assert(responses[1].Error(), NotNil)
 	c.Assert(responses[2].Error(), NotNil)
+	if err := s.verifyContextAwareDeadline(ctx); err != nil {
+		c.Error(err)
+	}
 }
 
-func (s *RawAsciiClientSuite) TestStoreCheckEmptyBuffers(c *C) {
+func (s *baseAsciiClientSuite) TestStoreCheckEmptyBuffers(c *C) {
+	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
+	defer cancel()
+
 	s.rw.recvBuf.WriteString("STORED\r\ncrap")
 
 	item := &Item{
@@ -348,7 +476,7 @@ func (s *RawAsciiClientSuite) TestStoreCheckEmptyBuffers(c *C) {
 		Expiration:    555,
 	}
 
-	resp := s.client.Set(item)
+	resp := s.client.Set(ctx, item)
 
 	c.Assert(
 		s.rw.sendBuf.String(),
@@ -357,9 +485,15 @@ func (s *RawAsciiClientSuite) TestStoreCheckEmptyBuffers(c *C) {
 	c.Assert(s.client.IsValidState(), IsFalse)
 
 	c.Assert(resp.Error(), IsNil)
+	if err := s.verifyContextAwareDeadline(ctx); err != nil {
+		c.Error(err)
+	}
 }
 
-func (s *RawAsciiClientSuite) TestAdd(c *C) {
+func (s *baseAsciiClientSuite) TestAdd(c *C) {
+	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
+	defer cancel()
+
 	s.rw.recvBuf.WriteString("STORED\r\n")
 
 	item := &Item{
@@ -370,7 +504,7 @@ func (s *RawAsciiClientSuite) TestAdd(c *C) {
 		Expiration:    555,
 	}
 
-	resp := s.client.Add(item)
+	resp := s.client.Add(ctx, item)
 
 	c.Assert(
 		s.rw.sendBuf.String(),
@@ -379,9 +513,15 @@ func (s *RawAsciiClientSuite) TestAdd(c *C) {
 	c.Assert(s.client.IsValidState(), IsTrue)
 
 	c.Assert(resp.Error(), IsNil)
+	if err := s.verifyContextAwareDeadline(ctx); err != nil {
+		c.Error(err)
+	}
 }
 
-func (s *RawAsciiClientSuite) TestAddInvalidCasId(c *C) {
+func (s *baseAsciiClientSuite) TestAddInvalidCasId(c *C) {
+	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
+	defer cancel()
+
 	item := &Item{
 		Key:           "key1",
 		Value:         []byte("item1"),
@@ -390,15 +530,19 @@ func (s *RawAsciiClientSuite) TestAddInvalidCasId(c *C) {
 		Expiration:    555,
 	}
 
-	resp := s.client.Add(item)
+	resp := s.client.Add(ctx, item)
 
 	c.Assert(s.rw.sendBuf.String(), Equals, "")
 	c.Assert(s.client.IsValidState(), IsTrue)
 
 	c.Assert(resp.Error(), NotNil)
+	c.Assert(s.rw.deadline, Equals, time.Time{}, Commentf("Deadline should be unset"))
 }
 
-func (s *RawAsciiClientSuite) TestReplace(c *C) {
+func (s *baseAsciiClientSuite) TestReplace(c *C) {
+	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
+	defer cancel()
+
 	s.rw.recvBuf.WriteString("STORED\r\n")
 
 	item := &Item{
@@ -409,7 +553,7 @@ func (s *RawAsciiClientSuite) TestReplace(c *C) {
 		Expiration:    555,
 	}
 
-	resp := s.client.Replace(item)
+	resp := s.client.Replace(ctx, item)
 
 	c.Assert(
 		s.rw.sendBuf.String(),
@@ -418,12 +562,18 @@ func (s *RawAsciiClientSuite) TestReplace(c *C) {
 	c.Assert(s.client.IsValidState(), IsTrue)
 
 	c.Assert(resp.Error(), IsNil)
+	if err := s.verifyContextAwareDeadline(ctx); err != nil {
+		c.Error(err)
+	}
 }
 
-func (s *RawAsciiClientSuite) TestAppend(c *C) {
+func (s *baseAsciiClientSuite) TestAppend(c *C) {
+	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
+	defer cancel()
+
 	s.rw.recvBuf.WriteString("STORED\r\n")
 
-	resp := s.client.Append("key", []byte("suffix"))
+	resp := s.client.Append(ctx, "key", []byte("suffix"))
 
 	c.Assert(
 		s.rw.sendBuf.String(),
@@ -432,12 +582,18 @@ func (s *RawAsciiClientSuite) TestAppend(c *C) {
 	c.Assert(s.client.IsValidState(), IsTrue)
 
 	c.Assert(resp.Error(), IsNil)
+	if err := s.verifyContextAwareDeadline(ctx); err != nil {
+		c.Error(err)
+	}
 }
 
-func (s *RawAsciiClientSuite) TestPrepend(c *C) {
+func (s *baseAsciiClientSuite) TestPrepend(c *C) {
+	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
+	defer cancel()
+
 	s.rw.recvBuf.WriteString("STORED\r\n")
 
-	resp := s.client.Prepend("key", []byte("prefix"))
+	resp := s.client.Prepend(ctx, "key", []byte("prefix"))
 
 	c.Assert(
 		s.rw.sendBuf.String(),
@@ -446,12 +602,18 @@ func (s *RawAsciiClientSuite) TestPrepend(c *C) {
 	c.Assert(s.client.IsValidState(), IsTrue)
 
 	c.Assert(resp.Error(), IsNil)
+	if err := s.verifyContextAwareDeadline(ctx); err != nil {
+		c.Error(err)
+	}
 }
 
-func (s *RawAsciiClientSuite) TestDelete(c *C) {
+func (s *baseAsciiClientSuite) TestDelete(c *C) {
+	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
+	defer cancel()
+
 	s.rw.recvBuf.WriteString("DELETED\r\nDELETED\r\n")
 
-	responses := s.client.DeleteMulti([]string{"key1", "key2"})
+	responses := s.client.DeleteMulti(ctx, []string{"key1", "key2"})
 
 	c.Assert(
 		s.rw.sendBuf.String(),
@@ -464,56 +626,86 @@ func (s *RawAsciiClientSuite) TestDelete(c *C) {
 		c.Assert(resp.Error(), IsNil)
 		c.Assert(resp.Status(), Equals, StatusNoError)
 	}
+	if err := s.verifyContextAwareDeadline(ctx); err != nil {
+		c.Error(err)
+	}
 }
 
-func (s *RawAsciiClientSuite) TestDeleteNotFound(c *C) {
+func (s *baseAsciiClientSuite) TestDeleteNotFound(c *C) {
+	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
+	defer cancel()
+
 	s.rw.recvBuf.WriteString("NOT_FOUND\r\n")
 
-	resp := s.client.Delete("key")
+	resp := s.client.Delete(ctx, "key")
 
 	c.Assert(s.rw.sendBuf.String(), Equals, "delete key\r\n")
 	c.Assert(s.client.IsValidState(), IsTrue)
 
 	c.Assert(resp.Error(), NotNil)
 	c.Assert(resp.Status(), Equals, StatusKeyNotFound)
+	if err := s.verifyContextAwareDeadline(ctx); err != nil {
+		c.Error(err)
+	}
 }
 
-func (s *RawAsciiClientSuite) TestDeleteError(c *C) {
+func (s *baseAsciiClientSuite) TestDeleteError(c *C) {
+	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
+	defer cancel()
+
 	s.rw.recvBuf.WriteString("SERVER_ERROR\r\n")
 
-	resp := s.client.Delete("key")
+	resp := s.client.Delete(ctx, "key")
 
 	c.Assert(s.rw.sendBuf.String(), Equals, "delete key\r\n")
 	c.Assert(s.client.IsValidState(), IsTrue)
 
 	c.Assert(resp.Error(), NotNil)
+	if err := s.verifyContextAwareDeadline(ctx); err != nil {
+		c.Error(err)
+	}
 }
 
-func (s *RawAsciiClientSuite) TestDeleteBadKey(c *C) {
-	resp := s.client.Delete("b a d")
+func (s *baseAsciiClientSuite) TestDeleteBadKey(c *C) {
+	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
+	defer cancel()
+
+	resp := s.client.Delete(ctx, "b a d")
 
 	c.Assert(s.rw.sendBuf.String(), Equals, "")
 	c.Assert(s.client.IsValidState(), IsTrue)
 
 	c.Assert(resp.Error(), NotNil)
+	if err := s.verifyContextAwareDeadline(ctx); err != nil {
+		c.Error(err)
+	}
 }
 
-func (s *RawAsciiClientSuite) TestDeleteCheckEmptyBuffers(c *C) {
+func (s *baseAsciiClientSuite) TestDeleteCheckEmptyBuffers(c *C) {
+	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
+	defer cancel()
+
 	s.rw.recvBuf.WriteString("DELETED\r\nextra")
 
-	resp := s.client.Delete("key")
+	resp := s.client.Delete(ctx, "key")
 
 	c.Assert(s.rw.sendBuf.String(), Equals, "delete key\r\n")
 	c.Assert(s.client.IsValidState(), IsFalse)
 
 	c.Assert(resp.Error(), IsNil)
 	c.Assert(resp.Status(), Equals, StatusNoError)
+	if err := s.verifyContextAwareDeadline(ctx); err != nil {
+		c.Error(err)
+	}
 }
 
-func (s *RawAsciiClientSuite) TestIncrement(c *C) {
+func (s *baseAsciiClientSuite) TestIncrement(c *C) {
+	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
+	defer cancel()
+
 	s.rw.recvBuf.WriteString("16\r\n")
 
-	resp := s.client.Increment("key", 2, 0, 0xffffffff)
+	resp := s.client.Increment(ctx, "key", 2, 0, 0xffffffff)
 
 	c.Assert(s.rw.sendBuf.String(), Equals, "incr key 2\r\n")
 	c.Assert(s.client.IsValidState(), IsTrue)
@@ -522,30 +714,44 @@ func (s *RawAsciiClientSuite) TestIncrement(c *C) {
 	c.Assert(resp.Status(), Equals, StatusNoError)
 	c.Assert(resp.Key(), Equals, "key")
 	c.Assert(resp.Count(), Equals, uint64(16))
+	if err := s.verifyContextAwareDeadline(ctx); err != nil {
+		c.Error(err)
+	}
 }
 
-func (s *RawAsciiClientSuite) TestIncrementBadKey(c *C) {
-	resp := s.client.Increment("b a d", 2, 0, 0xffffffff)
+func (s *baseAsciiClientSuite) TestIncrementBadKey(c *C) {
+	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
+	defer cancel()
+
+	resp := s.client.Increment(ctx, "b a d", 2, 0, 0xffffffff)
 
 	c.Assert(s.rw.sendBuf.String(), Equals, "")
 	c.Assert(s.client.IsValidState(), IsTrue)
 
 	c.Assert(resp.Error(), NotNil)
+	c.Assert(s.rw.deadline, Equals, time.Time{}, Commentf("Deadline should be unset"))
 }
 
-func (s *RawAsciiClientSuite) TestIncrementBadExpiration(c *C) {
-	resp := s.client.Increment("key", 2, 0, 0)
+func (s *baseAsciiClientSuite) TestIncrementBadExpiration(c *C) {
+	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
+	defer cancel()
+
+	resp := s.client.Increment(ctx, "key", 2, 0, 0)
 
 	c.Assert(s.rw.sendBuf.String(), Equals, "")
 	c.Assert(s.client.IsValidState(), IsTrue)
 
 	c.Assert(resp.Error(), NotNil)
+	c.Assert(s.rw.deadline, Equals, time.Time{}, Commentf("Deadline should be unset"))
 }
 
-func (s *RawAsciiClientSuite) TestIncrementNotFound(c *C) {
+func (s *baseAsciiClientSuite) TestIncrementNotFound(c *C) {
+	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
+	defer cancel()
+
 	s.rw.recvBuf.WriteString("NOT_FOUND\r\n")
 
-	resp := s.client.Increment("key", 2, 0, 0xffffffff)
+	resp := s.client.Increment(ctx, "key", 2, 0, 0xffffffff)
 
 	c.Assert(s.rw.sendBuf.String(), Equals, "incr key 2\r\n")
 	c.Assert(s.client.IsValidState(), IsTrue)
@@ -554,35 +760,53 @@ func (s *RawAsciiClientSuite) TestIncrementNotFound(c *C) {
 	c.Assert(resp.Status(), Equals, StatusKeyNotFound)
 	c.Assert(resp.Key(), Equals, "key")
 	c.Assert(resp.Count(), Equals, uint64(0))
+	if err := s.verifyContextAwareDeadline(ctx); err != nil {
+		c.Error(err)
+	}
 }
 
-func (s *RawAsciiClientSuite) TestIncrementError(c *C) {
+func (s *baseAsciiClientSuite) TestIncrementError(c *C) {
+	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
+	defer cancel()
+
 	s.rw.recvBuf.WriteString("SERVER_ERROR\r\n")
 
-	resp := s.client.Increment("key", 2, 0, 0xffffffff)
+	resp := s.client.Increment(ctx, "key", 2, 0, 0xffffffff)
 
 	c.Assert(s.rw.sendBuf.String(), Equals, "incr key 2\r\n")
 	c.Assert(s.client.IsValidState(), IsTrue)
 
 	c.Assert(resp.Error(), NotNil)
+	if err := s.verifyContextAwareDeadline(ctx); err != nil {
+		c.Error(err)
+	}
 }
 
-func (s *RawAsciiClientSuite) TestIncrementCheckEmptyBuffers(c *C) {
+func (s *baseAsciiClientSuite) TestIncrementCheckEmptyBuffers(c *C) {
+	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
+	defer cancel()
+
 	s.rw.recvBuf.WriteString("89\r\nextra")
 
-	resp := s.client.Increment("key", 24, 0, 0xffffffff)
+	resp := s.client.Increment(ctx, "key", 24, 0, 0xffffffff)
 
 	c.Assert(s.rw.sendBuf.String(), Equals, "incr key 24\r\n")
 	c.Assert(s.client.IsValidState(), IsFalse)
 
 	c.Assert(resp.Error(), IsNil)
 	c.Assert(resp.Count(), Equals, uint64(89))
+	if err := s.verifyContextAwareDeadline(ctx); err != nil {
+		c.Error(err)
+	}
 }
 
-func (s *RawAsciiClientSuite) TestDecrement(c *C) {
+func (s *baseAsciiClientSuite) TestDecrement(c *C) {
+	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
+	defer cancel()
+
 	s.rw.recvBuf.WriteString("123\r\n")
 
-	resp := s.client.Decrement("key1", 5, 0, 0xffffffff)
+	resp := s.client.Decrement(ctx, "key1", 5, 0, 0xffffffff)
 
 	c.Assert(s.rw.sendBuf.String(), Equals, "decr key1 5\r\n")
 	c.Assert(s.client.IsValidState(), IsTrue)
@@ -591,37 +815,58 @@ func (s *RawAsciiClientSuite) TestDecrement(c *C) {
 	c.Assert(resp.Status(), Equals, StatusNoError)
 	c.Assert(resp.Key(), Equals, "key1")
 	c.Assert(resp.Count(), Equals, uint64(123))
+	if err := s.verifyContextAwareDeadline(ctx); err != nil {
+		c.Error(err)
+	}
 }
 
-func (s *RawAsciiClientSuite) TestFlush(c *C) {
+func (s *baseAsciiClientSuite) TestFlush(c *C) {
+	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
+	defer cancel()
+
 	s.rw.recvBuf.WriteString("OK\r\n")
 
-	resp := s.client.Flush(123)
+	resp := s.client.Flush(ctx, 123)
 
 	c.Assert(s.rw.sendBuf.String(), Equals, "flush_all 123\r\n")
 	c.Assert(s.client.IsValidState(), IsTrue)
 
 	c.Assert(resp.Error(), IsNil)
+	if err := s.verifyContextAwareDeadline(ctx); err != nil {
+		c.Error(err)
+	}
 }
 
-func (s *RawAsciiClientSuite) TestFlushError(c *C) {
+func (s *baseAsciiClientSuite) TestFlushError(c *C) {
+	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
+	defer cancel()
+
 	s.rw.recvBuf.WriteString("SERVER_ERROR\r\n")
 
-	resp := s.client.Flush(0)
+	resp := s.client.Flush(ctx, 0)
 
 	c.Assert(s.rw.sendBuf.String(), Equals, "flush_all 0\r\n")
 	c.Assert(s.client.IsValidState(), IsTrue)
 
 	c.Assert(resp.Error(), NotNil)
+	if err := s.verifyContextAwareDeadline(ctx); err != nil {
+		c.Error(err)
+	}
 }
 
-func (s *RawAsciiClientSuite) TestFlushCheckEmptyBuffers(c *C) {
+func (s *baseAsciiClientSuite) TestFlushCheckEmptyBuffers(c *C) {
+	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
+	defer cancel()
+
 	s.rw.recvBuf.WriteString("OK\r\nextra")
 
-	resp := s.client.Flush(123)
+	resp := s.client.Flush(ctx, 123)
 
 	c.Assert(s.rw.sendBuf.String(), Equals, "flush_all 123\r\n")
 	c.Assert(s.client.IsValidState(), IsFalse)
 
 	c.Assert(resp.Error(), IsNil)
+	if err := s.verifyContextAwareDeadline(ctx); err != nil {
+		c.Error(err)
+	}
 }

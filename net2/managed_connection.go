@@ -1,6 +1,7 @@
 package net2
 
 import (
+	"context"
 	"net"
 	"time"
 
@@ -15,8 +16,9 @@ type NetworkAddress struct {
 }
 
 // A connection managed by a connection pool.  NOTE: SetDeadline,
-// SetReadDeadline and SetWriteDeadline are disabled for managed connections.
-// (The deadlines are set by the connection pool).
+// Setdeadline and Setdeadline are disabled for managed connections.
+// The deadline from the context is used if present, otherwise deadlines
+// are set by the connection pool.
 type ManagedConn interface {
 	net.Conn
 
@@ -37,14 +39,18 @@ type ManagedConn interface {
 	// This indicates the connection is an invalid state, and that the
 	// connection should be discarded from the connection pool.
 	DiscardConnection() error
+
+	// Sets the read/write deadline from the context.
+	SetDeadlineFromContext(ctx context.Context) error
 }
 
 // A physical implementation of ManagedConn
 type managedConnImpl struct {
-	addr    NetworkAddress
-	handle  resource_pool.ManagedHandle
-	pool    ConnectionPool
-	options ConnectionOptions
+	addr     NetworkAddress
+	handle   resource_pool.ManagedHandle
+	pool     ConnectionPool
+	options  ConnectionOptions
+	deadline time.Time // The read/write deadline. If zero, then options sets the deadline.
 }
 
 // This creates a managed connection wrapper.
@@ -106,7 +112,9 @@ func (c *managedConnImpl) Read(b []byte) (n int, err error) {
 		return 0, err
 	}
 
-	if c.options.ReadTimeout > 0 {
+	if !c.deadline.IsZero() {
+		_ = conn.SetReadDeadline(c.deadline)
+	} else if c.options.ReadTimeout > 0 {
 		deadline := c.options.getCurrentTime().Add(c.options.ReadTimeout)
 		_ = conn.SetReadDeadline(deadline)
 	}
@@ -137,7 +145,9 @@ func (c *managedConnImpl) Write(b []byte) (n int, err error) {
 		return 0, err
 	}
 
-	if c.options.WriteTimeout > 0 {
+	if !c.deadline.IsZero() {
+		_ = conn.SetWriteDeadline(c.deadline)
+	} else if c.options.WriteTimeout > 0 {
 		deadline := c.options.getCurrentTime().Add(c.options.WriteTimeout)
 		_ = conn.SetWriteDeadline(deadline)
 	}
@@ -181,4 +191,14 @@ func (c *managedConnImpl) SetReadDeadline(t time.Time) error {
 // us with respect to the write timeout specified in ConnectionOptions).
 func (c *managedConnImpl) SetWriteDeadline(t time.Time) error {
 	return errors.New("Cannot set write deadline for managed connection")
+}
+
+// SetDeadlineFromContext implements the DeadlineReadWriter interface.
+func (c *managedConnImpl) SetDeadlineFromContext(ctx context.Context) error {
+	if d, ok := ctx.Deadline(); ok {
+		c.deadline = d
+	} else {
+		c.deadline = time.Time{}
+	}
+	return nil
 }

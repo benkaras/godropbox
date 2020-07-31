@@ -1,6 +1,7 @@
 package memcache
 
 import (
+	"context"
 	"io"
 
 	"github.com/dropbox/godropbox/net2"
@@ -261,6 +262,155 @@ type ClientShard interface {
 
 // The ClientShardBuilder creates ClientShard by shard id and connection.
 type ClientShardBuilder func(shard int, channel io.ReadWriter) ClientShard
+
+// DeadlineReadWriter is a ReadWriter that can take a deadline from a context.
+type DeadlineReadWriter interface {
+	io.ReadWriter
+
+	// Sets the read/write deadline from the context.
+	SetDeadlineFromContext(ctx context.Context) error
+}
+
+// ContextClientShardBuilder creates ContextClientShard by shard id and connection.
+type ContextClientShardBuilder func(shard int, channel DeadlineReadWriter) ContextClientShard
+
+// ContextClient is a memcache client for talking to one or more memcache servers.
+type ContextClient interface {
+	// This retrieves a single entry from memcache.
+	Get(ctx context.Context, key string) GetResponse
+
+	// Batch version of the Get method.
+	GetMulti(kectx context.Context, ys []string) map[string]GetResponse
+
+	// *** This method is specific to Dropbox zookeeper-managed memcache ***
+	// This is the same as GetMulti.  The only difference is that GetMulti will
+	// only read from ACTIVE memcache shards, while GetSentinels will read from
+	// both ACTIVE and WRITE_ONLY memcache shards.
+	GetSentinels(ctx context.Context, keys []string) map[string]GetResponse
+
+	// This sets a single entry into memcache.  If the item's data version id
+	// (aka CAS) is nonzero, the set operation can only succeed if the item
+	// exists in memcache and has a same data version id; otherwise, this will
+	// do an unconditional set.
+	Set(ctx context.Context, item *Item) MutateResponse
+
+	// Batch version of the Set method.  Note that the response entries
+	// ordering is undefined (i.e., may not match the input ordering).
+	SetMulti(ctx context.Context, items []*Item) []MutateResponse
+
+	// *** This method is specific to Dropbox zookeeper-managed memcache ***
+	// This is the same as SetMulti.  The only difference is that SetMulti will
+	// only write to ACTIVE memcache shards, while SetSentinels will write to
+	// both ACTIVE and WRITE_ONLY memcache shards.
+	SetSentinels(ctx context.Context, items []*Item) []MutateResponse
+
+	// Just like SetMulti, but if item's data version id (aka CAS) is zero,
+	// it will do a **conditional** add (will fail if the item already exists
+	// in memcache).
+	CasMulti(ctx context.Context, items []*Item) []MutateResponse
+
+	// *** This method is specific to Dropbox zookeeper-managed memcache ***
+	// This is the same as CasMulti.  The only difference is that CasMulti will
+	// only write to ACTIVE memcache shards, while CasSentinels will write to
+	// both ACTIVE and WRITE_ONLY memcache shards.
+	CasSentinels(ctx context.Context, items []*Item) []MutateResponse
+
+	// This adds a single entry into memcache.  Note: Add will fail if the
+	// item already exist in memcache.
+	Add(ctx context.Context, item *Item) MutateResponse
+
+	// Batch version of the Add method.  Note that the response entries
+	// ordering is undefined (i.e., may not match the input ordering).
+	AddMulti(ctx context.Context, item []*Item) []MutateResponse
+
+	// This replaces a single entry in memcache.  Note: Replace will fail if
+	// the does not exist in memcache.
+	Replace(ctx context.Context, item *Item) MutateResponse
+
+	// This delets a single entry from memcache.
+	Delete(ctx context.Context, key string) MutateResponse
+
+	// Batch version of the Delete method.  Note that the response entries
+	// ordering is undefined (i.e., may not match the input ordering)
+	DeleteMulti(ctx context.Context, keys []string) []MutateResponse
+
+	// This appends the value bytes to the end of an existing entry.  Note that
+	// this does not allow you to extend past the item limit.
+	Append(ctx context.Context, key string, value []byte) MutateResponse
+
+	// This prepends the value bytes to the end of an existing entry.  Note that
+	// this does not allow you to extend past the item limit.
+	Prepend(ctx context.Context, key string, value []byte) MutateResponse
+
+	// This increments the key's counter by delta.  If the counter does not
+	// exist, one of two things may happen:
+	// 1. If the expiration value is all one-bits (0xffffffff), the operation
+	//    will fail with StatusNotFound.
+	// 2. For all other expiration values, the operation will succeed by
+	//    seeding the value for this key with the provided initValue to expire
+	//    with the provided expiration time. The flags will be set to zero.
+	//
+	// NOTE:
+	// 1. If you want to set the value of the counter with add/set/replace,
+	//    the objects data must be the ascii representation of the value and
+	//    not the byte values of a 64 bit integer.
+	// 2. Incrementing the counter may cause the counter to wrap.
+	Increment(
+		ctx context.Context,
+		key string,
+		delta uint64,
+		initValue uint64,
+		expiration uint32) CountResponse
+
+	// This decrements the key's counter by delta.  If the counter does not
+	// exist, one of two things may happen:
+	// 1. If the expiration value is all one-bits (0xffffffff), the operation
+	//    will fail with StatusNotFound.
+	// 2. For all other expiration values, the operation will succeed by
+	//    seeding the value for this key with the provided initValue to expire
+	//    with the provided expiration time. The flags will be set to zero.
+	//
+	// NOTE:
+	// 1. If you want to set the value of the counter with add/set/replace,
+	//    the objects data must be the ascii representation of the value and
+	//    not the byte values of a 64 bit integer.
+	// 2. Decrementing a counter will never result in a "negative value" (or
+	//    cause the counter to "wrap"). instead the counter is set to 0.
+	Decrement(
+		ctx context.Context,
+		key string,
+		delta uint64,
+		initValue uint64,
+		expiration uint32) CountResponse
+
+	// This invalidates all existing cache items after expiration number of
+	// seconds.
+	Flush(ctx context.Context, expiration uint32) Response
+
+	// This requests the server statistics. When the key is an empty string,
+	// the server will respond with a "default" set of statistics information.
+	Stat(ctx context.Context, statsKey string) StatResponse
+
+	// This returns the server's version string.
+	Version(ctx context.Context) VersionResponse
+
+	// This set the verbosity level of the server.
+	Verbosity(ctx context.Context, verbosity uint32) Response
+}
+
+// ContextClientShard is a memcache client which communicates with a specific memcache shard.
+type ContextClientShard interface {
+	ContextClient
+
+	// This returns the memcache server's shard id.
+	// NB: The name doesn't use initialisms to be consistent with the ClientShard interface.
+	ShardId() int
+
+	// This returns true if the client is in a valid state.  If the client is
+	// in invalid state, the user should abandon the current client / channel,
+	// and create a new client / channel as replacment.
+	IsValidState() bool
+}
 
 // Used for returning shard mapping results from ShardManager's
 // GetShardsForKeys/GetShardsForItems calls.

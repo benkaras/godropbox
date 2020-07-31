@@ -2,6 +2,7 @@ package memcache
 
 import (
 	"bytes"
+	"context"
 	"testing"
 	"time"
 
@@ -31,6 +32,8 @@ type mockReadWriter struct {
 	receivedChan chan struct{}
 	// Notification channel for sendBuf.
 	sentChan chan struct{}
+	// Deadline set via context
+	deadline time.Time
 }
 
 func newMockReadWriter() *mockReadWriter {
@@ -54,6 +57,15 @@ func (rw *mockReadWriter) Write(p []byte) (n int, err error) {
 	return rw.sendBuf.Write(p)
 }
 
+// SetDeadlineFromContext implements DeadlineReaderWriter interface.
+func (rw *mockReadWriter) SetDeadlineFromContext(ctx context.Context) error {
+	rw.deadline = time.Time{}
+	if d, ok := ctx.Deadline(); ok {
+		rw.deadline = d
+	}
+	return nil
+}
+
 // Hook up gocheck into go test runner
 func Test(t *testing.T) {
 	TestingT(t)
@@ -61,14 +73,14 @@ func Test(t *testing.T) {
 
 type RawBinaryClientSuite struct {
 	rw     *mockReadWriter
-	client *RawBinaryClient
+	client ClientShard
 }
 
 var _ = Suite(&RawBinaryClientSuite{})
 
 func (s *RawBinaryClientSuite) SetUpTest(c *C) {
 	s.rw = newMockReadWriter()
-	s.client = NewRawBinaryClient(0, s.rw).(*RawBinaryClient)
+	s.client = NewRawBinaryClient(0, s.rw)
 }
 
 func (s *RawBinaryClientSuite) verifyRequestMessage(c *C, code opCode) {
@@ -139,7 +151,202 @@ func (s *RawBinaryClientSuite) verifyRequestMessage(c *C, code opCode) {
 	c.Assert(s.rw.sendBuf.Bytes(), DeepEquals, serializedRequestMessage)
 }
 
-func (s *RawBinaryClientSuite) TestSendRequest(c *C) {
+func (s *RawBinaryClientSuite) performMutateRequestTest(
+	c *C,
+	code opCode,
+	isMulti bool) {
+
+	// Populate the add response.
+	var serializedResponseMessage = []byte{
+		respMagicByte, // magic
+		uint8(code),   // op code
+		0x00, 0x04,    // key length
+		0x0,        // extras length
+		0x0,        // data type
+		0x00, 0x00, // status
+		0x00, 0x00, 0x00, 0x04, // total length
+		0x00, 0x00, 0x00, 0x00, // opaque
+		0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, // cas
+		'H', 'e', 'l', 'l', 'o', // key
+	}
+	_, err := s.rw.recvBuf.Write(serializedResponseMessage)
+	c.Assert(err, IsNil)
+
+	// Kick off the add.
+	item := createTestItem()
+	respChan := make(chan []MutateResponse)
+	go func() {
+		if code == opAdd {
+			if isMulti {
+				respChan <- s.client.AddMulti([]*Item{item})
+			} else {
+				respChan <- []MutateResponse{s.client.Add(item)}
+			}
+		} else if code == opSet {
+			if isMulti {
+				respChan <- s.client.SetMulti([]*Item{item})
+			} else {
+				respChan <- []MutateResponse{s.client.Set(item)}
+			}
+		}
+	}()
+
+	// Wait for the request buffer to be populated.
+	select {
+	case <-s.rw.sentChan:
+	case <-time.After(500 * time.Millisecond):
+		c.Fatal("Timed out waiting for client to send request")
+	}
+
+	s.verifyRequestMessage(c, code)
+
+	resps := <-respChan
+	c.Assert(resps, HasLen, 1)
+	resp := resps[0]
+	c.Assert(resp.Error(), IsNil)
+	c.Assert(resp.Key(), Equals, testKey)
+	c.Assert(resp.DataVersionId(), Equals, uint64(1))
+	c.Assert(s.rw.deadline, Equals, time.Time{}, Commentf("Deadline should be unset"))
+}
+
+func (s *RawBinaryClientSuite) TestAddRequest(c *C) {
+	s.performMutateRequestTest(c, opAdd, false)
+}
+
+func (s *RawBinaryClientSuite) TestAddMultiRequest(c *C) {
+	s.performMutateRequestTest(c, opAdd, true)
+}
+
+func (s *RawBinaryClientSuite) TestSetRequest(c *C) {
+	s.performMutateRequestTest(c, opSet, false)
+}
+
+func (s *RawBinaryClientSuite) TestSetMultiRequest(c *C) {
+	s.performMutateRequestTest(c, opSet, true)
+}
+
+func (s *RawBinaryClientSuite) TestGetMultiDupKeys(c *C) {
+	expectedFooReq := []byte{
+		reqMagicByte, // magic
+		uint8(opGet), // op code
+		0x00, 0x03,   // key length
+		0x00,       // extra length
+		0x00,       // data type
+		0x00, 0x00, // v bucket id
+		0x00, 0x00, 0x00, 0x3, // total body length
+		0x00, 0x00, 0x00, 0x00, // opaque
+		0x00, 0x00, 0x00, 0x00, // flags
+		0x00, 0x00, 0x00, 0x00, // expiry
+		'f', 'o', 'o', // key
+	}
+
+	fooResp := []byte{
+		respMagicByte, // magic
+		uint8(opGet),  // op code
+		0x00, 0x03,    // key length
+		0x04,       // extras length
+		0x0,        // data type
+		0x00, 0x00, // status
+		0x00, 0x00, 0x00, 0x0a, // total length
+		0x00, 0x00, 0x00, 0x00, // opaque
+		0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, // cas
+		0xde, 0xad, 0xbe, 0xef, // flags
+		'f', 'o', 'o', // key
+		'F', 'O', 'O', // value
+	}
+
+	s.rw.recvBuf.Write(fooResp)
+
+	results := s.client.GetMulti([]string{"foo", "foo"})
+
+	c.Assert(s.rw.sendBuf.Bytes(), DeepEquals, expectedFooReq)
+
+	c.Assert(results, HasKey, "foo")
+	c.Assert(string(results["foo"].Value()), Equals, "FOO")
+	c.Assert(s.rw.deadline, Equals, time.Time{}, Commentf("Deadline should be unset"))
+}
+
+type ContextRawBinaryClientSuite struct {
+	rw     *mockReadWriter
+	client *ContextRawBinaryClient
+}
+
+var _ = Suite(&ContextRawBinaryClientSuite{})
+
+func (s *ContextRawBinaryClientSuite) SetUpTest(c *C) {
+	s.rw = newMockReadWriter()
+	s.client = NewContextRawBinaryClient(0, s.rw).(*ContextRawBinaryClient)
+}
+
+func (s *ContextRawBinaryClientSuite) verifyRequestMessage(c *C, code opCode) {
+	/*
+	     Byte/     0       |       1       |       2       |       3       |
+	        /              |               |               |               |
+	       |0 1 2 3 4 5 6 7|0 1 2 3 4 5 6 7|0 1 2 3 4 5 6 7|0 1 2 3 4 5 6 7|
+	       +---------------+---------------+---------------+---------------+
+	      0| 0x80          | 0x02          | 0x00          | 0x05          |
+	       +---------------+---------------+---------------+---------------+
+	      4| 0x08          | 0x00          | 0x00          | 0x00          |
+	       +---------------+---------------+---------------+---------------+
+	      8| 0x00          | 0x00          | 0x00          | 0x12          |
+	       +---------------+---------------+---------------+---------------+
+	     12| 0x00          | 0x00          | 0x00          | 0x00          |
+	       +---------------+---------------+---------------+---------------+
+	     16| 0x00          | 0x00          | 0x00          | 0x00          |
+	       +---------------+---------------+---------------+---------------+
+	     20| 0xde          | 0xca          | 0xfb          | 0xad          |
+	       +---------------+---------------+---------------+---------------+
+	     24| 0xde          | 0xad          | 0xbe          | 0xef          |
+	       +---------------+---------------+---------------+---------------+
+	     28| 0x00          | 0x00          | 0x0e          | 0x10          |
+	       +---------------+---------------+---------------+---------------+
+	     32| 0x48 ('H')    | 0x65 ('e')    | 0x6c ('l')    | 0x6c ('l')    |
+	       +---------------+---------------+---------------+---------------+
+	     36| 0x6f ('o')    | 0x57 ('W')    | 0x6f ('o')    | 0x72 ('r')    |
+	       +---------------+---------------+---------------+---------------+
+	     40| 0x6c ('l')    | 0x64 ('d')    |
+	       +---------------+---------------+
+
+	      Total 42 bytes (24 byte header, 8 byte extras, 5 byte key and
+	                       5 byte value)
+
+
+	   Field        (offset) (value)
+	    Magic        (0)    : reqMagicByte
+	    Opcode       (1)    : 0x0X
+	    Key length   (2,3)  : 0x0005
+	    Extra length (4)    : 0x08
+	    Data type    (5)    : 0x00
+	    VBucket      (6,7)  : 0x0000
+	    Total body   (8-11) : 0x00000012
+	    Opaque       (12-15): 0x00000000
+	    CAS          (16-23): 0x00000000decafbad
+	    Extras              :
+	      Flags      (24-27): 0xdeadbeef
+	      Expiry     (28-31): 0x00000e10
+	    Key          (32-36): The textual string "Hello"
+	    Value        (37-41): The textual string "World"
+	*/
+	var serializedRequestMessage = []byte{
+		reqMagicByte, // magic
+		uint8(code),  // op code
+		0x00, 0x05,   // key length
+		0x08,       // extra length
+		0x00,       // data type
+		0x00, 0x00, // v bucket id
+		0x00, 0x00, 0x00, 0x12, // total body length
+		0x00, 0x00, 0x00, 0x00, // opaque
+		0x00, 0x00, 0x00, 0x00, 0xde, 0xca, 0xfb, 0xad, // cas
+		0xde, 0xad, 0xbe, 0xef, // flags
+		0x00, 0x00, 0x0e, 0x10, // expiry
+		'H', 'e', 'l', 'l', 'o', // key
+		'W', 'o', 'r', 'l', 'd', // value
+	}
+
+	c.Assert(s.rw.sendBuf.Bytes(), DeepEquals, serializedRequestMessage)
+}
+
+func (s *ContextRawBinaryClientSuite) TestSendRequest(c *C) {
 	err := s.client.sendRequest(
 		opAdd,
 		testCas,         // CAS
@@ -152,7 +359,7 @@ func (s *RawBinaryClientSuite) TestSendRequest(c *C) {
 	s.verifyRequestMessage(c, opAdd)
 }
 
-func (s *RawBinaryClientSuite) TestSendRequestKeyTooLong(c *C) {
+func (s *ContextRawBinaryClientSuite) TestSendRequestKeyTooLong(c *C) {
 	var key [256]byte
 	err := s.client.sendRequest(
 		opAdd,
@@ -164,7 +371,7 @@ func (s *RawBinaryClientSuite) TestSendRequestKeyTooLong(c *C) {
 	c.Assert(err, NotNil)
 }
 
-func (s *RawBinaryClientSuite) TestRecvResponse(c *C) {
+func (s *ContextRawBinaryClientSuite) TestRecvResponse(c *C) {
 	/*
 	    Byte/     0       |       1       |       2       |       3       |
 	        /              |               |               |               |
@@ -243,7 +450,7 @@ func (s *RawBinaryClientSuite) TestRecvResponse(c *C) {
 	c.Assert(flags, Equals, uint32(0xdeadbeef))
 }
 
-func (s *RawBinaryClientSuite) TestRecvResponseNoExtrasByteWithExtrasArg(c *C) {
+func (s *ContextRawBinaryClientSuite) TestRecvResponseNoExtrasByteWithExtrasArg(c *C) {
 
 	var serializedResponseMessage = []byte{
 		respMagicByte, // magic
@@ -270,7 +477,7 @@ func (s *RawBinaryClientSuite) TestRecvResponseNoExtrasByteWithExtrasArg(c *C) {
 	c.Assert(err, NotNil)
 }
 
-func (s *RawBinaryClientSuite) TestRecvResponseNotEnoughExtrasBytes(c *C) {
+func (s *ContextRawBinaryClientSuite) TestRecvResponseNotEnoughExtrasBytes(c *C) {
 	var serializedResponseMessage = []byte{
 		respMagicByte, // magic
 		0x09,          // op code
@@ -299,7 +506,7 @@ func (s *RawBinaryClientSuite) TestRecvResponseNotEnoughExtrasBytes(c *C) {
 	c.Assert(err, NotNil)
 }
 
-func (s *RawBinaryClientSuite) TestRecvResponseTooManExtrasBytes(c *C) {
+func (s *ContextRawBinaryClientSuite) TestRecvResponseTooManExtrasBytes(c *C) {
 	var serializedResponseMessage = []byte{
 		respMagicByte, // magic
 		0x09,          // op code
@@ -326,7 +533,7 @@ func (s *RawBinaryClientSuite) TestRecvResponseTooManExtrasBytes(c *C) {
 	c.Assert(err, NotNil)
 }
 
-func (s *RawBinaryClientSuite) TestRecvResponseBadTotalLength(c *C) {
+func (s *ContextRawBinaryClientSuite) TestRecvResponseBadTotalLength(c *C) {
 	var serializedResponseMessage = []byte{
 		respMagicByte, // magic
 		0x09,          // op code
@@ -353,7 +560,7 @@ func (s *RawBinaryClientSuite) TestRecvResponseBadTotalLength(c *C) {
 	c.Assert(err, NotNil)
 }
 
-func (s *RawBinaryClientSuite) TestRecvResponseBadMagic(c *C) {
+func (s *ContextRawBinaryClientSuite) TestRecvResponseBadMagic(c *C) {
 	var serializedResponseMessage = []byte{
 		0x82,       // (bad) magic
 		0x09,       // op code
@@ -380,7 +587,7 @@ func (s *RawBinaryClientSuite) TestRecvResponseBadMagic(c *C) {
 	c.Assert(err, NotNil)
 }
 
-func (s *RawBinaryClientSuite) TestRecvResponseBadOpCode(c *C) {
+func (s *ContextRawBinaryClientSuite) TestRecvResponseBadOpCode(c *C) {
 
 	var serializedResponseMessage = []byte{
 		respMagicByte, // magic
@@ -418,10 +625,12 @@ func createTestItem() *Item {
 	}
 }
 
-func (s *RawBinaryClientSuite) performMutateRequestTest(
+func (s *ContextRawBinaryClientSuite) performMutateRequestTest(
 	c *C,
 	code opCode,
 	isMulti bool) {
+	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
+	defer cancel()
 
 	// Populate the add response.
 	var serializedResponseMessage = []byte{
@@ -445,15 +654,15 @@ func (s *RawBinaryClientSuite) performMutateRequestTest(
 	go func() {
 		if code == opAdd {
 			if isMulti {
-				respChan <- s.client.AddMulti([]*Item{item})
+				respChan <- s.client.AddMulti(ctx, []*Item{item})
 			} else {
-				respChan <- []MutateResponse{s.client.Add(item)}
+				respChan <- []MutateResponse{s.client.Add(ctx, item)}
 			}
 		} else if code == opSet {
 			if isMulti {
-				respChan <- s.client.SetMulti([]*Item{item})
+				respChan <- s.client.SetMulti(ctx, []*Item{item})
 			} else {
-				respChan <- []MutateResponse{s.client.Set(item)}
+				respChan <- []MutateResponse{s.client.Set(ctx, item)}
 			}
 		}
 	}()
@@ -473,25 +682,31 @@ func (s *RawBinaryClientSuite) performMutateRequestTest(
 	c.Assert(resp.Error(), IsNil)
 	c.Assert(resp.Key(), Equals, testKey)
 	c.Assert(resp.DataVersionId(), Equals, uint64(1))
+	if s.rw.deadline.IsZero() || time.Until(s.rw.deadline) > time.Minute {
+		c.Errorf("Got timeout %s; want <= %s", time.Until(s.rw.deadline), time.Minute)
+	}
 }
 
-func (s *RawBinaryClientSuite) TestAddRequest(c *C) {
+func (s *ContextRawBinaryClientSuite) TestAddRequest(c *C) {
 	s.performMutateRequestTest(c, opAdd, false)
 }
 
-func (s *RawBinaryClientSuite) TestAddMultiRequest(c *C) {
+func (s *ContextRawBinaryClientSuite) TestAddMultiRequest(c *C) {
 	s.performMutateRequestTest(c, opAdd, true)
 }
 
-func (s *RawBinaryClientSuite) TestSetRequest(c *C) {
+func (s *ContextRawBinaryClientSuite) TestSetRequest(c *C) {
 	s.performMutateRequestTest(c, opSet, false)
 }
 
-func (s *RawBinaryClientSuite) TestSetMultiRequest(c *C) {
+func (s *ContextRawBinaryClientSuite) TestSetMultiRequest(c *C) {
 	s.performMutateRequestTest(c, opSet, true)
 }
 
-func (s *RawBinaryClientSuite) TestGetMultiDupKeys(c *C) {
+func (s *ContextRawBinaryClientSuite) TestGetMultiDupKeys(c *C) {
+	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
+	defer cancel()
+
 	expectedFooReq := []byte{
 		reqMagicByte, // magic
 		uint8(opGet), // op code
@@ -523,10 +738,13 @@ func (s *RawBinaryClientSuite) TestGetMultiDupKeys(c *C) {
 
 	s.rw.recvBuf.Write(fooResp)
 
-	results := s.client.GetMulti([]string{"foo", "foo"})
+	results := s.client.GetMulti(ctx, []string{"foo", "foo"})
 
 	c.Assert(s.rw.sendBuf.Bytes(), DeepEquals, expectedFooReq)
 
 	c.Assert(results, HasKey, "foo")
 	c.Assert(string(results["foo"].Value()), Equals, "FOO")
+	if s.rw.deadline.IsZero() || time.Until(s.rw.deadline) > time.Minute {
+		c.Errorf("Got timeout %s; want <= %s", time.Until(s.rw.deadline), time.Minute)
+	}
 }

@@ -1,6 +1,7 @@
 package memcache
 
 import (
+	"context"
 	"strconv"
 	"sync"
 
@@ -22,20 +23,54 @@ const (
 	Decrement
 )
 
-func NewMockClient() Client {
+// NewMockContextClient returns a fake client.
+func NewMockContextClient() ContextClientShard {
 	return &MockClient{data: make(map[string]*Item)}
 }
 
-func NewMockClientErrorAllSets() Client {
+// NewMockContextClientErrorAllSets returns a fake client that fails all sets.
+func NewMockContextClientErrorAllSets() ContextClientShard {
 	return &MockClient{data: make(map[string]*Item), forceSetInternalErrors: true}
 }
 
-func NewMockClientMissAllGets() Client {
+// NewMockContextClientMissAllGets returns a fake client that fails all gets.
+func NewMockContextClientMissAllGets() ContextClientShard {
 	return &MockClient{data: make(map[string]*Item), forceGetMisses: true}
 }
 
-func NewMockClientFailEverything() Client {
+// NewMockContextClientFailEverything returns a fake client that fails all calls.
+func NewMockContextClientFailEverything() ContextClientShard {
 	return &MockClient{data: make(map[string]*Item), forceFailEverything: true}
+}
+
+// NewMockClient returns a fake client.
+func NewMockClient() ClientShard {
+	return newContextlessClientShardAdapter(&MockClient{data: make(map[string]*Item)})
+}
+
+// NewMockClientErrorAllSets returns a fake client that fails all sets.
+func NewMockClientErrorAllSets() ClientShard {
+	return newContextlessClientShardAdapter(&MockClient{data: make(map[string]*Item), forceSetInternalErrors: true})
+}
+
+// NewMockClientMissAllGets returns a fake client that fails all gets.
+func NewMockClientMissAllGets() ClientShard {
+	return newContextlessClientShardAdapter(&MockClient{data: make(map[string]*Item), forceGetMisses: true})
+}
+
+// NewMockClientFailEverything returns a fake client that fails all calls.
+func NewMockClientFailEverything() ClientShard {
+	return newContextlessClientShardAdapter(&MockClient{data: make(map[string]*Item), forceFailEverything: true})
+}
+
+// IsValidState implements the ContextClientShard interface.
+func (c *MockClient) IsValidState() bool {
+	return !c.forceFailEverything
+}
+
+// ShardId implements the ContextClientShard interface.
+func (c *MockClient) ShardId() int {
+	return 0
 }
 
 func (c *MockClient) getHelper(key string) GetResponse {
@@ -54,16 +89,16 @@ func (c *MockClient) getHelper(key string) GetResponse {
 	return NewGetResponse(key, StatusKeyNotFound, 0, nil, 0)
 }
 
-// This retrieves a single entry from memcache.
-func (c *MockClient) Get(key string) GetResponse {
+// Get implements the ContextClient interface. This retrieves a single entry from memcache.
+func (c *MockClient) Get(ctx context.Context, key string) GetResponse {
 	c.mutex.Lock()
 	defer c.mutex.Unlock()
 
 	return c.getHelper(key)
 }
 
-// Batch version of the Get method.
-func (c *MockClient) GetMulti(keys []string) map[string]GetResponse {
+// GetMulti implements the ContextClient interface. Batch version of the Get method.
+func (c *MockClient) GetMulti(ctx context.Context, keys []string) map[string]GetResponse {
 	c.mutex.Lock()
 	defer c.mutex.Unlock()
 
@@ -74,8 +109,9 @@ func (c *MockClient) GetMulti(keys []string) map[string]GetResponse {
 	return res
 }
 
-func (c *MockClient) GetSentinels(keys []string) map[string]GetResponse {
-	return c.GetMulti(keys)
+// GetSentinels implements the ContextClient interface.
+func (c *MockClient) GetSentinels(ctx context.Context, keys []string) map[string]GetResponse {
+	return c.GetMulti(ctx, keys)
 }
 
 func (c *MockClient) setHelper(item *Item) MutateResponse {
@@ -128,19 +164,21 @@ func (c *MockClient) casHelper(item *Item) MutateResponse {
 	}
 }
 
+// Set implements the ContextClient interface.
 // This sets a single entry into memcache.  If the item's data version id
 // (aka CAS) is nonzero, the set operation can only succeed if the item
 // exists in memcache and has a same data version id.
-func (c *MockClient) Set(item *Item) MutateResponse {
+func (c *MockClient) Set(ctx context.Context, item *Item) MutateResponse {
 	c.mutex.Lock()
 	defer c.mutex.Unlock()
 
 	return c.setHelper(item)
 }
 
+// SetMulti implements the ContextClient interface.
 // Batch version of the Set method.  Note that the response entries
 // ordering is undefined (i.e., may not match the input ordering).
-func (c *MockClient) SetMulti(items []*Item) []MutateResponse {
+func (c *MockClient) SetMulti(ctx context.Context, items []*Item) []MutateResponse {
 	c.mutex.Lock()
 	defer c.mutex.Unlock()
 
@@ -151,12 +189,14 @@ func (c *MockClient) SetMulti(items []*Item) []MutateResponse {
 	return res
 }
 
-func (c *MockClient) SetSentinels(items []*Item) []MutateResponse {
+// SetSentinels implements the ContextClient interface.
+func (c *MockClient) SetSentinels(ctx context.Context, items []*Item) []MutateResponse {
 	// TODO(patrick): Support state mocking
-	return c.SetMulti(items)
+	return c.SetMulti(ctx, items)
 }
 
-func (c *MockClient) CasMulti(items []*Item) []MutateResponse {
+// CasMulti implements the ContextClient interface.
+func (c *MockClient) CasMulti(ctx context.Context, items []*Item) []MutateResponse {
 	c.mutex.Lock()
 	defer c.mutex.Unlock()
 
@@ -167,8 +207,9 @@ func (c *MockClient) CasMulti(items []*Item) []MutateResponse {
 	return res
 }
 
-func (c *MockClient) CasSentinels(items []*Item) []MutateResponse {
-	return c.CasMulti(items)
+// CasSentinels implements the ContextClient interface.
+func (c *MockClient) CasSentinels(ctx context.Context, items []*Item) []MutateResponse {
+	return c.CasMulti(ctx, items)
 }
 
 func (c *MockClient) addHelper(item *Item) MutateResponse {
@@ -201,18 +242,20 @@ func (c *MockClient) addHelper(item *Item) MutateResponse {
 	}
 }
 
+// Add implements the ContextClient interface.
 // This adds a single entry into memcache.  Note: Add will fail if the
 // item already exist in memcache.
-func (c *MockClient) Add(item *Item) MutateResponse {
+func (c *MockClient) Add(ctx context.Context, item *Item) MutateResponse {
 	c.mutex.Lock()
 	defer c.mutex.Unlock()
 
 	return c.addHelper(item)
 }
 
+// AddMulti implements the ContextClient interface.
 // Batch version of the Add method.  Note that the response entries
 // ordering is undefined (i.e., may not match the input ordering).
-func (c *MockClient) AddMulti(items []*Item) []MutateResponse {
+func (c *MockClient) AddMulti(ctx context.Context, items []*Item) []MutateResponse {
 	c.mutex.Lock()
 	defer c.mutex.Unlock()
 
@@ -223,16 +266,18 @@ func (c *MockClient) AddMulti(items []*Item) []MutateResponse {
 	return res
 }
 
+// Replace implements the ContextClient interface.
 // This replaces a single entry in memcache.  Note: Replace will fail if
 // the does not exist in memcache.
-func (c *MockClient) Replace(item *Item) MutateResponse {
+func (c *MockClient) Replace(ctx context.Context, item *Item) MutateResponse {
 	return NewMutateErrorResponse(
 		item.Key,
 		errors.Newf("Replace not implemented"))
 }
 
+// Delete implements the ContextClient interface.
 // This deletes a single entry from memcache.
-func (c *MockClient) Delete(key string) MutateResponse {
+func (c *MockClient) Delete(ctx context.Context, key string) MutateResponse {
 	c.mutex.Lock()
 	defer c.mutex.Unlock()
 
@@ -259,25 +304,28 @@ func (c *MockClient) Delete(key string) MutateResponse {
 		0)
 }
 
+// DeleteMulti implements the ContextClient interface.
 // Batch version of the Delete method.  Note that the response entries
 // ordering is undefined (i.e., may not match the input ordering)
-func (c *MockClient) DeleteMulti(keys []string) []MutateResponse {
+func (c *MockClient) DeleteMulti(ctx context.Context, keys []string) []MutateResponse {
 	res := make([]MutateResponse, len(keys))
 	for i, key := range keys {
-		res[i] = c.Delete(key)
+		res[i] = c.Delete(ctx, key)
 	}
 	return res
 }
 
+// Append implements the ContextClient interface.
 // This appends the value bytes to the end of an existing entry.  Note that
 // this does not allow you to extend past the item limit.
-func (c *MockClient) Append(key string, value []byte) MutateResponse {
+func (c *MockClient) Append(ctx context.Context, key string, value []byte) MutateResponse {
 	return NewMutateErrorResponse(key, errors.Newf("Append not implemented"))
 }
 
+// Prepend implements the ContextClient interface.
 // This prepends the value bytes to the end of an existing entry.  Note that
 // this does not allow you to extend past the item limit.
-func (c *MockClient) Prepend(key string, value []byte) MutateResponse {
+func (c *MockClient) Prepend(ctx context.Context, key string, value []byte) MutateResponse {
 	return NewMutateErrorResponse(key, errors.Newf("Prepend not implemented"))
 }
 
@@ -339,6 +387,7 @@ func (c *MockClient) incrementDecrementHelper(
 
 }
 
+// Increment implements the ContextClient interface.
 // This increments the key's counter by delta.  If the counter does not
 // exist, one of two things may happen:
 // 1. If the expiration value is all one-bits (0xffffffff), the operation
@@ -352,7 +401,7 @@ func (c *MockClient) incrementDecrementHelper(
 // the objects data must be the ascii representation of the value and
 // not the byte values of a 64 bit integer.
 // 2. Incrementing the counter may cause the counter to wrap.
-func (c *MockClient) Increment(
+func (c *MockClient) Increment(ctx context.Context,
 	key string,
 	delta uint64,
 	initValue uint64,
@@ -364,6 +413,7 @@ func (c *MockClient) Increment(
 
 }
 
+// Decrement implements the ContextClient interface.
 // This decrements the key's counter by delta.  If the counter does not
 // exist, one of two things may happen:
 // 1. If the expiration value is all one-bits (0xffffffff), the operation
@@ -378,7 +428,7 @@ func (c *MockClient) Increment(
 // not the byte values of a 64 bit integer.
 // 2. Decrementing a counter will never result in a "negative value" (or
 // cause the counter to "wrap"). instead the counter is set to 0.
-func (c *MockClient) Decrement(
+func (c *MockClient) Decrement(ctx context.Context,
 	key string,
 	delta uint64,
 	initValue uint64,
@@ -390,9 +440,10 @@ func (c *MockClient) Decrement(
 
 }
 
+// Flush implements the ContextClient interface.
 // This invalidates all existing cache items after expiration number of
 // seconds.
-func (c *MockClient) Flush(expiration uint32) Response {
+func (c *MockClient) Flush(ctx context.Context, expiration uint32) Response {
 	c.mutex.Lock()
 	defer c.mutex.Unlock()
 
@@ -401,18 +452,21 @@ func (c *MockClient) Flush(expiration uint32) Response {
 	return NewResponse(StatusNoError)
 }
 
+// Stat implements the ContextClient interface.
 // This requests the server statistics. When the key is an empty string,
 // the server will respond with a "default" set of statistics information.
-func (c *MockClient) Stat(statsKey string) StatResponse {
+func (c *MockClient) Stat(ctx context.Context, statsKey string) StatResponse {
 	return NewStatErrorResponse(errors.Newf("Stat not implemented"), nil)
 }
 
+// Version implements the ContextClient interface.
 // This returns the server's version string.
-func (c *MockClient) Version() VersionResponse {
+func (c *MockClient) Version(ctx context.Context) VersionResponse {
 	return NewVersionResponse(StatusNoError, map[int]string{0: "MockSever"})
 }
 
+// Verbosity implements the ContextClient interface.
 // This set the verbosity level of the server.
-func (c *MockClient) Verbosity(verbosity uint32) Response {
+func (c *MockClient) Verbosity(ctx context.Context, verbosity uint32) Response {
 	return NewResponse(StatusNoError)
 }
