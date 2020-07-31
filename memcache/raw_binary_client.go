@@ -2,6 +2,7 @@ package memcache
 
 import (
 	"bytes"
+	"context"
 	"encoding/binary"
 	"io"
 	"sync"
@@ -85,23 +86,24 @@ func (h *header) Deserialize(buffer []byte) {
 	h.DataVersionId = binary.BigEndian.Uint64(buffer[16:])
 }
 
-// An unsharded memcache client implementation which operates on a pre-existing
-// io channel (The user must explicitly setup and close down the channel),
-// using the binary memcached protocol.  Note that the client assumes nothing
-// else is sending or receiving on the network channel.  In general, all client
-// operations are serialized (Use multiple channels / clients if parallelism
-// is needed).
-type RawBinaryClient struct {
+// ContextRawBinaryClient is an unsharded memcache client implementation which
+// operates on a pre-existing io channel (The user must explicitly setup and
+// close down the channel), using the binary memcached protocol.  Note that the
+// client assumes nothing else is sending or receiving on the network channel.
+// In general, all client operations are serialized (Use multiple channels /
+// clients if parallelism is needed). This client accepts a context.Context which
+// determines deadlines for calls.
+type ContextRawBinaryClient struct {
 	shard          int
-	channel        io.ReadWriter
+	channel        DeadlineReadWriter
 	mutex          sync.Mutex
 	validState     bool
 	maxValueLength int
 }
 
-// This creates a new memcache RawBinaryClient.
-func NewRawBinaryClient(shard int, channel io.ReadWriter) ClientShard {
-	return &RawBinaryClient{
+// NewContextRawBinaryClient creates a new ContextRawBinaryClient.
+func NewContextRawBinaryClient(shard int, channel DeadlineReadWriter) ContextClientShard {
+	return &ContextRawBinaryClient{
 		shard:          shard,
 		channel:        channel,
 		validState:     true,
@@ -109,9 +111,9 @@ func NewRawBinaryClient(shard int, channel io.ReadWriter) ClientShard {
 	}
 }
 
-// This creates a new memcache RawBinaryClient for use with np-large cluster.
-func NewLargeRawBinaryClient(shard int, channel io.ReadWriter) ClientShard {
-	return &RawBinaryClient{
+// NewContextLargeRawBinaryClient creates a new ContextRawBinaryClient for use with np-large cluster.
+func NewContextLargeRawBinaryClient(shard int, channel DeadlineReadWriter) ContextClientShard {
+	return &ContextRawBinaryClient{
 		shard:          shard,
 		channel:        channel,
 		validState:     true,
@@ -119,19 +121,44 @@ func NewLargeRawBinaryClient(shard int, channel io.ReadWriter) ClientShard {
 	}
 }
 
-// See ClientShard interface for documentation.
-func (c *RawBinaryClient) ShardId() int {
+// NewRawBinaryClient creates a new memcache unsharded memcache client
+// implementation which operates on a pre-existing io channel (The user must
+// explicitly setup and close down the channel), using the binary memcached
+// protocol. Note that the client assumes nothing else is sending or receiving
+// on the network channel.  In general, all client operations are serialized
+// (Use multiple channels / clients if parallelism is needed).
+func NewRawBinaryClient(shard int, channel io.ReadWriter) ClientShard {
+	return newContextlessClientShardAdapter(
+		NewContextRawBinaryClient(shard, &noDeadlineReadWriter{channel}),
+	)
+}
+
+// NewLargeRawBinaryClient creates a new memcache binary for use with np-large cluster.
+// The implementation operates on a pre-existing io channel (The user must
+// explicitly setup and close down the channel), using the binary memcached
+// protocol. Note that the client assumes nothing else is sending or receiving
+// on the network channel.  In general, all client operations are serialized
+// (Use multiple channels / clients if parallelism is needed).
+func NewLargeRawBinaryClient(shard int, channel io.ReadWriter) ClientShard {
+	return newContextlessClientShardAdapter(
+		NewContextLargeRawBinaryClient(shard, &noDeadlineReadWriter{channel}),
+	)
+}
+
+// ShardId implements the ContextClientShard interface.
+// NB: The name doesn't use initialisms to be consistent with the ClientShard interface.
+func (c *ContextRawBinaryClient) ShardId() int {
 	return c.shard
 }
 
-// See ClientShard interface for documentation.
-func (c *RawBinaryClient) IsValidState() bool {
+// IsValidState implements the ContextClientShard interface.
+func (c *ContextRawBinaryClient) IsValidState() bool {
 	return c.validState
 }
 
 // Sends a memcache request through the connection.  NOTE: extras must be
 // fix-sized values.
-func (c *RawBinaryClient) sendRequest(
+func (c *ContextRawBinaryClient) sendRequest(
 	code opCode,
 	dataVersionId uint64, // aka CAS
 	key []byte, // may be nil
@@ -202,7 +229,7 @@ func (c *RawBinaryClient) sendRequest(
 // dataVersionId (aka CAS), key and value are returned, while the extra
 // values are stored in the arguments.  NOTE: extras must be pointers to
 // fix-sized values.
-func (c *RawBinaryClient) receiveResponse(
+func (c *ContextRawBinaryClient) receiveResponse(
 	expectedCode opCode,
 	extras ...interface{}) (
 	status ResponseStatus,
@@ -307,7 +334,7 @@ func (c *RawBinaryClient) receiveResponse(
 	return
 }
 
-func (c *RawBinaryClient) sendGetRequest(key string) GetResponse {
+func (c *ContextRawBinaryClient) sendGetRequest(key string) GetResponse {
 	if !isValidKeyString(key) {
 		return NewGetErrorResponse(
 			key,
@@ -322,7 +349,7 @@ func (c *RawBinaryClient) sendGetRequest(key string) GetResponse {
 	return nil
 }
 
-func (c *RawBinaryClient) receiveGetResponse(key string) GetResponse {
+func (c *ContextRawBinaryClient) receiveGetResponse(key string) GetResponse {
 	var flags uint32
 	status, version, _, value, err := c.receiveResponse(opGet, &flags)
 	if err != nil {
@@ -331,10 +358,11 @@ func (c *RawBinaryClient) receiveGetResponse(key string) GetResponse {
 	return NewGetResponse(key, status, flags, value, version)
 }
 
-// See Client interface for documentation.
-func (c *RawBinaryClient) Get(key string) GetResponse {
+// Get implements the ContextClient interface.
+func (c *ContextRawBinaryClient) Get(ctx context.Context, key string) GetResponse {
 	c.mutex.Lock()
 	defer c.mutex.Unlock()
+	c.channel.SetDeadlineFromContext(ctx)
 
 	if resp := c.sendGetRequest(key); resp != nil {
 		return resp
@@ -343,7 +371,7 @@ func (c *RawBinaryClient) Get(key string) GetResponse {
 	return c.receiveGetResponse(key)
 }
 
-func (c *RawBinaryClient) removeDuplicateKey(keys []string) []string {
+func (c *ContextRawBinaryClient) removeDuplicateKey(keys []string) []string {
 	keyMap := make(map[string]interface{})
 	for _, key := range keys {
 		keyMap[key] = nil
@@ -357,8 +385,8 @@ func (c *RawBinaryClient) removeDuplicateKey(keys []string) []string {
 	return cacheKeys
 }
 
-// See Client interface for documentation.
-func (c *RawBinaryClient) GetMulti(keys []string) map[string]GetResponse {
+// GetMulti implements the ContextClient interface.
+func (c *ContextRawBinaryClient) GetMulti(ctx context.Context, keys []string) map[string]GetResponse {
 	if keys == nil {
 		return nil
 	}
@@ -368,6 +396,7 @@ func (c *RawBinaryClient) GetMulti(keys []string) map[string]GetResponse {
 
 	c.mutex.Lock()
 	defer c.mutex.Unlock()
+	c.channel.SetDeadlineFromContext(ctx)
 
 	for _, key := range cacheKeys {
 		if resp := c.sendGetRequest(key); resp != nil {
@@ -385,13 +414,14 @@ func (c *RawBinaryClient) GetMulti(keys []string) map[string]GetResponse {
 	return responses
 }
 
-func (c *RawBinaryClient) GetSentinels(keys []string) map[string]GetResponse {
+// GetSentinels implements the ContextClient interface.
+func (c *ContextRawBinaryClient) GetSentinels(ctx context.Context, keys []string) map[string]GetResponse {
 	// For raw clients, there are no difference between GetMulti and
 	// GetSentinels.
-	return c.GetMulti(keys)
+	return c.GetMulti(ctx, keys)
 }
 
-func (c *RawBinaryClient) sendMutateRequest(
+func (c *ContextRawBinaryClient) sendMutateRequest(
 	code opCode,
 	item *Item,
 	addExtras bool) MutateResponse {
@@ -428,7 +458,7 @@ func (c *RawBinaryClient) sendMutateRequest(
 	return nil
 }
 
-func (c *RawBinaryClient) receiveMutateResponse(
+func (c *ContextRawBinaryClient) receiveMutateResponse(
 	code opCode,
 	key string) MutateResponse {
 
@@ -440,13 +470,14 @@ func (c *RawBinaryClient) receiveMutateResponse(
 }
 
 // Perform a mutation operation specified by the given code.
-func (c *RawBinaryClient) mutate(code opCode, item *Item) MutateResponse {
+func (c *ContextRawBinaryClient) mutate(ctx context.Context, code opCode, item *Item) MutateResponse {
 	if item == nil {
 		return NewMutateErrorResponse("", errors.New("item is nil"))
 	}
 
 	c.mutex.Lock()
 	defer c.mutex.Unlock()
+	c.channel.SetDeadlineFromContext(ctx)
 
 	if resp := c.sendMutateRequest(code, item, true); resp != nil {
 		return resp
@@ -458,7 +489,8 @@ func (c *RawBinaryClient) mutate(code opCode, item *Item) MutateResponse {
 // Batch version of the mutate method.  Note that the response entries
 // ordering is undefined (i.e., may not match the input ordering)
 // When DataVersionId is 0, zeroVersionIdCode is used instead of code.
-func (c *RawBinaryClient) mutateMulti(
+func (c *ContextRawBinaryClient) mutateMulti(
+	ctx context.Context,
 	code opCode, zeroVersionIdCode opCode,
 	items []*Item) []MutateResponse {
 
@@ -475,6 +507,7 @@ func (c *RawBinaryClient) mutateMulti(
 
 	c.mutex.Lock()
 	defer c.mutex.Unlock()
+	c.channel.SetDeadlineFromContext(ctx)
 
 	var itemCode opCode
 	for i, item := range items {
@@ -499,53 +532,54 @@ func (c *RawBinaryClient) mutateMulti(
 	return responses
 }
 
-// See Client interface for documentation.
-func (c *RawBinaryClient) Set(item *Item) MutateResponse {
-	return c.mutate(opSet, item)
+// Set implements the ContextClient interface.
+func (c *ContextRawBinaryClient) Set(ctx context.Context, item *Item) MutateResponse {
+	return c.mutate(ctx, opSet, item)
 }
 
-// See Client interface for documentation.
-func (c *RawBinaryClient) SetMulti(items []*Item) []MutateResponse {
-	return c.mutateMulti(opSet, opSet, items)
+// SetMulti implements the ContextClient interface.
+func (c *ContextRawBinaryClient) SetMulti(ctx context.Context, items []*Item) []MutateResponse {
+	return c.mutateMulti(ctx, opSet, opSet, items)
 }
 
-// See Client interface for documentation.
-func (c *RawBinaryClient) SetSentinels(items []*Item) []MutateResponse {
+// SetSentinels implements the ContextClient interface.
+func (c *ContextRawBinaryClient) SetSentinels(ctx context.Context, items []*Item) []MutateResponse {
 	// For raw clients, there are no difference between SetMulti and
 	// SetSentinels.
-	return c.SetMulti(items)
+	return c.SetMulti(ctx, items)
 }
 
-// See Client interface for documentation.
-func (c *RawBinaryClient) CasMulti(items []*Item) []MutateResponse {
-	return c.mutateMulti(opSet, opAdd, items)
+// CasMulti implements the ContextClient interface.
+func (c *ContextRawBinaryClient) CasMulti(ctx context.Context, items []*Item) []MutateResponse {
+	return c.mutateMulti(ctx, opSet, opAdd, items)
 }
 
-// See Client interface for documentation.
-func (c *RawBinaryClient) CasSentinels(items []*Item) []MutateResponse {
+// CasSentinels implements the ContextClient interface.
+func (c *ContextRawBinaryClient) CasSentinels(ctx context.Context, items []*Item) []MutateResponse {
 	// For raw clients, there are no difference between CasMulti and
 	// CasSentinels.
-	return c.CasMulti(items)
+	return c.CasMulti(ctx, items)
 }
 
-// See Client interface for documentation.
-func (c *RawBinaryClient) Add(item *Item) MutateResponse {
-	return c.mutate(opAdd, item)
+// Add implements the ContextClient interface.
+func (c *ContextRawBinaryClient) Add(ctx context.Context, item *Item) MutateResponse {
+	return c.mutate(ctx, opAdd, item)
 }
 
-// See Client interface for documentation.
-func (c *RawBinaryClient) AddMulti(items []*Item) []MutateResponse {
-	return c.mutateMulti(opAdd, opAdd, items)
+// AddMulti implements the ContextClient interface.
+func (c *ContextRawBinaryClient) AddMulti(ctx context.Context, items []*Item) []MutateResponse {
+	return c.mutateMulti(ctx, opAdd, opAdd, items)
 }
 
-// See Client interface for documentation.
-func (c *RawBinaryClient) Replace(item *Item) MutateResponse {
+// Replace implements the ContextClient interface.
+func (c *ContextRawBinaryClient) Replace(ctx context.Context, item *Item) MutateResponse {
 	if item == nil {
 		return NewMutateErrorResponse("", errors.New("item is nil"))
 	}
 
 	c.mutex.Lock()
 	defer c.mutex.Unlock()
+	c.channel.SetDeadlineFromContext(ctx)
 
 	if resp := c.sendMutateRequest(opReplace, item, true); resp != nil {
 		return resp
@@ -554,7 +588,7 @@ func (c *RawBinaryClient) Replace(item *Item) MutateResponse {
 	return c.receiveMutateResponse(opReplace, item.Key)
 }
 
-func (c *RawBinaryClient) sendDeleteRequest(key string) MutateResponse {
+func (c *ContextRawBinaryClient) sendDeleteRequest(key string) MutateResponse {
 	if !isValidKeyString(key) {
 		return NewMutateErrorResponse(
 			key,
@@ -567,10 +601,11 @@ func (c *RawBinaryClient) sendDeleteRequest(key string) MutateResponse {
 	return nil
 }
 
-// See Client interface for documentation.
-func (c *RawBinaryClient) Delete(key string) MutateResponse {
+// Delete implements the ContextClient interface.
+func (c *ContextRawBinaryClient) Delete(ctx context.Context, key string) MutateResponse {
 	c.mutex.Lock()
 	defer c.mutex.Unlock()
+	c.channel.SetDeadlineFromContext(ctx)
 
 	if resp := c.sendDeleteRequest(key); resp != nil {
 		return resp
@@ -579,8 +614,8 @@ func (c *RawBinaryClient) Delete(key string) MutateResponse {
 	return c.receiveMutateResponse(opDelete, key)
 }
 
-// See Client interface for documentation.
-func (c *RawBinaryClient) DeleteMulti(keys []string) []MutateResponse {
+// DeleteMulti implements the ContextClient interface.
+func (c *ContextRawBinaryClient) DeleteMulti(ctx context.Context, keys []string) []MutateResponse {
 	if keys == nil {
 		return nil
 	}
@@ -589,6 +624,7 @@ func (c *RawBinaryClient) DeleteMulti(keys []string) []MutateResponse {
 
 	c.mutex.Lock()
 	defer c.mutex.Unlock()
+	c.channel.SetDeadlineFromContext(ctx)
 
 	for i, key := range keys {
 		responses[i] = c.sendDeleteRequest(key)
@@ -604,8 +640,8 @@ func (c *RawBinaryClient) DeleteMulti(keys []string) []MutateResponse {
 	return responses
 }
 
-// See Client interface for documentation.
-func (c *RawBinaryClient) Append(key string, value []byte) MutateResponse {
+// Append implements the ContextClient interface.
+func (c *ContextRawBinaryClient) Append(ctx context.Context, key string, value []byte) MutateResponse {
 	item := &Item{
 		Key:   key,
 		Value: value,
@@ -613,6 +649,7 @@ func (c *RawBinaryClient) Append(key string, value []byte) MutateResponse {
 
 	c.mutex.Lock()
 	defer c.mutex.Unlock()
+	c.channel.SetDeadlineFromContext(ctx)
 
 	if resp := c.sendMutateRequest(opAppend, item, false); resp != nil {
 		return resp
@@ -621,8 +658,8 @@ func (c *RawBinaryClient) Append(key string, value []byte) MutateResponse {
 	return c.receiveMutateResponse(opAppend, item.Key)
 }
 
-// See Client interface for documentation.
-func (c *RawBinaryClient) Prepend(key string, value []byte) MutateResponse {
+// Prepend implements the ContextClient interface.
+func (c *ContextRawBinaryClient) Prepend(ctx context.Context, key string, value []byte) MutateResponse {
 	item := &Item{
 		Key:   key,
 		Value: value,
@@ -630,6 +667,7 @@ func (c *RawBinaryClient) Prepend(key string, value []byte) MutateResponse {
 
 	c.mutex.Lock()
 	defer c.mutex.Unlock()
+	c.channel.SetDeadlineFromContext(ctx)
 
 	if resp := c.sendMutateRequest(opPrepend, item, false); resp != nil {
 		return resp
@@ -638,7 +676,7 @@ func (c *RawBinaryClient) Prepend(key string, value []byte) MutateResponse {
 	return c.receiveMutateResponse(opPrepend, item.Key)
 }
 
-func (c *RawBinaryClient) sendCountRequest(
+func (c *ContextRawBinaryClient) sendCountRequest(
 	code opCode,
 	key string,
 	delta uint64,
@@ -665,7 +703,7 @@ func (c *RawBinaryClient) sendCountRequest(
 	return nil
 }
 
-func (c *RawBinaryClient) receiveCountResponse(
+func (c *ContextRawBinaryClient) receiveCountResponse(
 	code opCode,
 	key string) CountResponse {
 
@@ -683,8 +721,9 @@ func (c *RawBinaryClient) receiveCountResponse(
 	return NewCountResponse(key, status, count)
 }
 
-// See Client interface for documentation.
-func (c *RawBinaryClient) Increment(
+// Increment implements the ContextClient interface.
+func (c *ContextRawBinaryClient) Increment(
+	ctx context.Context,
 	key string,
 	delta uint64,
 	initValue uint64,
@@ -692,6 +731,7 @@ func (c *RawBinaryClient) Increment(
 
 	c.mutex.Lock()
 	defer c.mutex.Unlock()
+	c.channel.SetDeadlineFromContext(ctx)
 
 	resp := c.sendCountRequest(opIncrement, key, delta, initValue, expiration)
 	if resp != nil {
@@ -700,8 +740,9 @@ func (c *RawBinaryClient) Increment(
 	return c.receiveCountResponse(opIncrement, key)
 }
 
-// See Client interface for documentation.
-func (c *RawBinaryClient) Decrement(
+// Decrement implements the ContextClient interface.
+func (c *ContextRawBinaryClient) Decrement(
+	ctx context.Context,
 	key string,
 	delta uint64,
 	initValue uint64,
@@ -709,6 +750,7 @@ func (c *RawBinaryClient) Decrement(
 
 	c.mutex.Lock()
 	defer c.mutex.Unlock()
+	c.channel.SetDeadlineFromContext(ctx)
 
 	resp := c.sendCountRequest(opDecrement, key, delta, initValue, expiration)
 	if resp != nil {
@@ -717,14 +759,15 @@ func (c *RawBinaryClient) Decrement(
 	return c.receiveCountResponse(opDecrement, key)
 }
 
-// See Client interface for documentation.
-func (c *RawBinaryClient) Stat(statsKey string) StatResponse {
+// Stat implements the ContextClient interface.
+func (c *ContextRawBinaryClient) Stat(ctx context.Context, statsKey string) StatResponse {
 	shardEntries := make(map[int](map[string]string))
 	entries := make(map[string]string)
 	shardEntries[c.ShardId()] = entries
 
 	c.mutex.Lock()
 	defer c.mutex.Unlock()
+	c.channel.SetDeadlineFromContext(ctx)
 
 	if !isValidKeyString(statsKey) {
 		return NewStatErrorResponse(
@@ -756,12 +799,13 @@ func (c *RawBinaryClient) Stat(statsKey string) StatResponse {
 	return NewStatResponse(StatusNoError, shardEntries)
 }
 
-// See Client interface for documentation.
-func (c *RawBinaryClient) Version() VersionResponse {
+// Version implements the ContextClient interface.
+func (c *ContextRawBinaryClient) Version(ctx context.Context) VersionResponse {
 	versions := make(map[int]string)
 
 	c.mutex.Lock()
 	defer c.mutex.Unlock()
+	c.channel.SetDeadlineFromContext(ctx)
 
 	err := c.sendRequest(opVersion, 0, nil, nil)
 	if err != nil {
@@ -777,12 +821,14 @@ func (c *RawBinaryClient) Version() VersionResponse {
 	return NewVersionResponse(status, versions)
 }
 
-func (c *RawBinaryClient) genericOp(
+func (c *ContextRawBinaryClient) genericOp(
+	ctx context.Context,
 	code opCode,
 	extras ...interface{}) Response {
 
 	c.mutex.Lock()
 	defer c.mutex.Unlock()
+	c.channel.SetDeadlineFromContext(ctx)
 
 	err := c.sendRequest(code, 0, nil, nil, extras...)
 	if err != nil {
@@ -796,12 +842,12 @@ func (c *RawBinaryClient) genericOp(
 	return NewResponse(status)
 }
 
-// See Client interface for documentation.
-func (c *RawBinaryClient) Flush(expiration uint32) Response {
-	return c.genericOp(opFlush, expiration)
+// Flush implements the ContextClient interface.
+func (c *ContextRawBinaryClient) Flush(ctx context.Context, expiration uint32) Response {
+	return c.genericOp(ctx, opFlush, expiration)
 }
 
-// See Client interface for documentation.
-func (c *RawBinaryClient) Verbosity(verbosity uint32) Response {
-	return c.genericOp(opVerbosity, verbosity)
+// Verbosity implements the ContextClient interface.
+func (c *ContextRawBinaryClient) Verbosity(ctx context.Context, verbosity uint32) Response {
+	return c.genericOp(ctx, opVerbosity, verbosity)
 }

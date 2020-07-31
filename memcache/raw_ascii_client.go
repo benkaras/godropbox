@@ -2,6 +2,7 @@ package memcache
 
 import (
 	"bufio"
+	"context"
 	"io"
 	"strconv"
 	"strings"
@@ -10,15 +11,16 @@ import (
 	"github.com/dropbox/godropbox/errors"
 )
 
-// An unsharded memcache client implementation which operates on a pre-existing
-// io channel (The user must explicitly setup and close down the channel),
-// using the ascii memcache protocol.  Note that the client assumes nothing
-// else is sending or receiving on the network channel.  In general, all client
-// operations are serialized (Use multiple channels / clients if parallelism
-// is needed).
-type RawAsciiClient struct {
+// ContextRawAsciiClient is an unsharded memcache client implementation which
+// operates on a pre-existing io channel (The user must explicitly setup and
+// close down the channel), using the ascii memcache protocol.  Note that the
+// client assumes nothing else is sending or receiving on the network channel.
+// In general, all client operations are serialized (Use multiple channels /
+// clients if parallelism is needed). This client accepts a context.Context which
+// determines deadlines for calls.
+type ContextRawAsciiClient struct {
 	shard   int
-	channel io.ReadWriter
+	channel DeadlineReadWriter
 
 	mutex      sync.Mutex
 	validState bool
@@ -26,9 +28,9 @@ type RawAsciiClient struct {
 	reader     *bufio.Reader
 }
 
-// This creates a new memcache RawAsciiClient.
-func NewRawAsciiClient(shard int, channel io.ReadWriter) ClientShard {
-	return &RawAsciiClient{
+// NewContextRawAsciiClient creates a new memcache ContextRawAsciiClient.
+func NewContextRawAsciiClient(shard int, channel DeadlineReadWriter) ContextClientShard {
+	return &ContextRawAsciiClient{
 		shard:      shard,
 		channel:    channel,
 		validState: true,
@@ -37,7 +39,19 @@ func NewRawAsciiClient(shard int, channel io.ReadWriter) ClientShard {
 	}
 }
 
-func (c *RawAsciiClient) writeStrings(strs ...string) error {
+// NewRawAsciiClient creates a new unsharded memcache client implementation which
+// operates on a pre-existing io channel (The user must explicitly setup and
+// close down the channel), using the ascii memcache protocol.  Note that the
+// client assumes nothing else is sending or receiving on the network channel.
+// In general, all client operations are serialized (Use multiple channels /
+// clients if parallelism is needed)..
+func NewRawAsciiClient(shard int, channel io.ReadWriter) ClientShard {
+	return newContextlessClientShardAdapter(
+		NewContextRawAsciiClient(shard, &noDeadlineReadWriter{channel}),
+	)
+}
+
+func (c *ContextRawAsciiClient) writeStrings(strs ...string) error {
 	if !c.validState {
 		return errors.New("Skipping due to previous error")
 	}
@@ -53,7 +67,7 @@ func (c *RawAsciiClient) writeStrings(strs ...string) error {
 	return nil
 }
 
-func (c *RawAsciiClient) flushWriter() error {
+func (c *ContextRawAsciiClient) flushWriter() error {
 	if !c.validState {
 		return errors.New("Skipping due to previous error")
 	}
@@ -67,7 +81,7 @@ func (c *RawAsciiClient) flushWriter() error {
 	return nil
 }
 
-func (c *RawAsciiClient) readLine() (string, error) {
+func (c *ContextRawAsciiClient) readLine() (string, error) {
 	line, isPrefix, err := c.reader.ReadLine()
 	if err != nil {
 		c.validState = false
@@ -81,7 +95,7 @@ func (c *RawAsciiClient) readLine() (string, error) {
 	return string(line), nil
 }
 
-func (c *RawAsciiClient) read(numBytes int) ([]byte, error) {
+func (c *ContextRawAsciiClient) read(numBytes int) ([]byte, error) {
 	result := make([]byte, numBytes, numBytes)
 
 	_, err := io.ReadFull(c.reader, result)
@@ -93,7 +107,7 @@ func (c *RawAsciiClient) read(numBytes int) ([]byte, error) {
 	return result, nil
 }
 
-func (c *RawAsciiClient) checkEmptyBuffers() error {
+func (c *ContextRawAsciiClient) checkEmptyBuffers() error {
 	if c.writer.Buffered() != 0 {
 		c.validState = false
 		return errors.New("writer buffer not fully flushed")
@@ -106,22 +120,26 @@ func (c *RawAsciiClient) checkEmptyBuffers() error {
 	return nil
 }
 
-func (c *RawAsciiClient) ShardId() int {
+// ShardId implements the ContextClientShard interface.
+func (c *ContextRawAsciiClient) ShardId() int {
 	return c.shard
 }
 
-func (c *RawAsciiClient) IsValidState() bool {
+// IsValidState implements the ContextClientShard interface.
+func (c *ContextRawAsciiClient) IsValidState() bool {
 	c.mutex.Lock()
 	defer c.mutex.Unlock()
 
 	return c.validState
 }
 
-func (c *RawAsciiClient) Get(key string) GetResponse {
-	return c.GetMulti([]string{key})[key]
+// Get implements the ContextClient interface.
+func (c *ContextRawAsciiClient) Get(ctx context.Context, key string) GetResponse {
+	return c.GetMulti(ctx, []string{key})[key]
 }
 
-func (c *RawAsciiClient) GetMulti(keys []string) map[string]GetResponse {
+// GetMulti implements the ContextClient interface.
+func (c *ContextRawAsciiClient) GetMulti(ctx context.Context, keys []string) map[string]GetResponse {
 	responses := make(map[string]GetResponse, len(keys))
 	neededKeys := []string{}
 	for _, key := range keys {
@@ -152,6 +170,7 @@ func (c *RawAsciiClient) GetMulti(keys []string) map[string]GetResponse {
 
 	c.mutex.Lock()
 	defer c.mutex.Unlock()
+	c.channel.SetDeadlineFromContext(ctx)
 
 	// NOTE: Always use gets instead of get since returning the extra cas id
 	// info is relatively cheap.
@@ -268,13 +287,15 @@ func (c *RawAsciiClient) GetMulti(keys []string) map[string]GetResponse {
 	return responses
 }
 
-func (c *RawAsciiClient) GetSentinels(keys []string) map[string]GetResponse {
+// GetSentinels implements the ContextClient interface.
+func (c *ContextRawAsciiClient) GetSentinels(ctx context.Context, keys []string) map[string]GetResponse {
 	// For raw clients, there are no difference between GetMulti and
 	// GetSentinels.
-	return c.GetMulti(keys)
+	return c.GetMulti(ctx, keys)
 }
 
-func (c *RawAsciiClient) storeRequests(
+func (c *ContextRawAsciiClient) storeRequests(
+	ctx context.Context,
 	cmd string,
 	items []*Item,
 	allowNonZeros bool) []MutateResponse {
@@ -327,6 +348,7 @@ func (c *RawAsciiClient) storeRequests(
 
 	c.mutex.Lock()
 	defer c.mutex.Unlock()
+	c.channel.SetDeadlineFromContext(ctx)
 
 	// NOTE: store requests are pipelined.
 	for i, item := range items {
@@ -419,71 +441,84 @@ func (c *RawAsciiClient) storeRequests(
 	return responses
 }
 
-func (c *RawAsciiClient) Set(item *Item) MutateResponse {
-	return c.SetMulti([]*Item{item})[0]
+// Set implements the ContextClient interface.
+func (c *ContextRawAsciiClient) Set(ctx context.Context, item *Item) MutateResponse {
+	return c.SetMulti(ctx, []*Item{item})[0]
 }
 
-func (c *RawAsciiClient) SetMulti(items []*Item) []MutateResponse {
-	return c.storeRequests("set", items, true)
+// SetMulti implements the ContextClient interface.
+func (c *ContextRawAsciiClient) SetMulti(ctx context.Context, items []*Item) []MutateResponse {
+	return c.storeRequests(ctx, "set", items, true)
 }
 
-func (c *RawAsciiClient) SetSentinels(items []*Item) []MutateResponse {
+// SetSentinels implements the ContextClient interface.
+func (c *ContextRawAsciiClient) SetSentinels(ctx context.Context, items []*Item) []MutateResponse {
 	// There are no difference between SetMutli and SetSentinels since
 	// SetMulti issues set / cas commands depending on the items' version ids.
-	return c.SetMulti(items)
+	return c.SetMulti(ctx, items)
 }
 
-func (c *RawAsciiClient) CasMulti(items []*Item) []MutateResponse {
-	return c.storeRequests("add", items, true)
+// CasMulti implements the ContextClient interface.
+func (c *ContextRawAsciiClient) CasMulti(ctx context.Context, items []*Item) []MutateResponse {
+	return c.storeRequests(ctx, "add", items, true)
 }
 
-func (c *RawAsciiClient) CasSentinels(items []*Item) []MutateResponse {
+// CasSentinels implements the ContextClient interface.
+func (c *ContextRawAsciiClient) CasSentinels(ctx context.Context, items []*Item) []MutateResponse {
 	// For raw clients, there are no difference between CasMulti and
 	// CasSentinels.
-	return c.CasMulti(items)
+	return c.CasMulti(ctx, items)
 }
 
-func (c *RawAsciiClient) Add(item *Item) MutateResponse {
-	return c.AddMulti([]*Item{item})[0]
+// Add implements the ContextClient interface.
+func (c *ContextRawAsciiClient) Add(ctx context.Context, item *Item) MutateResponse {
+	return c.AddMulti(ctx, []*Item{item})[0]
 }
 
-func (c *RawAsciiClient) AddMulti(items []*Item) []MutateResponse {
-	return c.storeRequests("add", items, false)
+// AddMulti implements the ContextClient interface.
+func (c *ContextRawAsciiClient) AddMulti(ctx context.Context, items []*Item) []MutateResponse {
+	return c.storeRequests(ctx, "add", items, false)
 }
 
-func (c *RawAsciiClient) Replace(item *Item) MutateResponse {
-	return c.storeRequests("replace", []*Item{item}, false)[0]
+// Replace implements the ContextClient interface.
+func (c *ContextRawAsciiClient) Replace(ctx context.Context, item *Item) MutateResponse {
+	return c.storeRequests(ctx, "replace", []*Item{item}, false)[0]
 }
 
-func (c *RawAsciiClient) Append(key string, value []byte) MutateResponse {
+// Append implements the ContextClient interface.
+func (c *ContextRawAsciiClient) Append(ctx context.Context, key string, value []byte) MutateResponse {
 	items := []*Item{
 		{
 			Key:   key,
 			Value: value,
 		},
 	}
-	return c.storeRequests("append", items, false)[0]
+	return c.storeRequests(ctx, "append", items, false)[0]
 }
 
-func (c *RawAsciiClient) Prepend(key string, value []byte) MutateResponse {
+// Prepend implements the ContextClient interface.
+func (c *ContextRawAsciiClient) Prepend(ctx context.Context, key string, value []byte) MutateResponse {
 	items := []*Item{
 		{
 			Key:   key,
 			Value: value,
 		},
 	}
-	return c.storeRequests("prepend", items, false)[0]
+	return c.storeRequests(ctx, "prepend", items, false)[0]
 }
 
-func (c *RawAsciiClient) Delete(key string) MutateResponse {
-	return c.DeleteMulti([]string{key})[0]
+// Delete implements the ContextClient interface.
+func (c *ContextRawAsciiClient) Delete(ctx context.Context, key string) MutateResponse {
+	return c.DeleteMulti(ctx, []string{key})[0]
 }
 
-func (c *RawAsciiClient) DeleteMulti(keys []string) []MutateResponse {
+// DeleteMulti implements the ContextClient interface.
+func (c *ContextRawAsciiClient) DeleteMulti(ctx context.Context, keys []string) []MutateResponse {
 	responses := make([]MutateResponse, len(keys), len(keys))
 
 	c.mutex.Lock()
 	defer c.mutex.Unlock()
+	c.channel.SetDeadlineFromContext(ctx)
 
 	// NOTE: delete requests are pipelined.
 	for i, key := range keys {
@@ -536,7 +571,8 @@ func (c *RawAsciiClient) DeleteMulti(keys []string) []MutateResponse {
 	return responses
 }
 
-func (c *RawAsciiClient) countRequest(
+func (c *ContextRawAsciiClient) countRequest(
+	ctx context.Context,
 	cmd string,
 	key string,
 	delta uint64,
@@ -559,6 +595,7 @@ func (c *RawAsciiClient) countRequest(
 
 	c.mutex.Lock()
 	defer c.mutex.Unlock()
+	c.channel.SetDeadlineFromContext(ctx)
 
 	err := c.writeStrings(
 		cmd, " ",
@@ -592,27 +629,33 @@ func (c *RawAsciiClient) countRequest(
 	return NewCountResponse(key, StatusNoError, val)
 }
 
-func (c *RawAsciiClient) Increment(
+// Increment implements the ContextClient interface.
+func (c *ContextRawAsciiClient) Increment(
+	ctx context.Context,
 	key string,
 	delta uint64,
 	initValue uint64,
 	expiration uint32) CountResponse {
 
-	return c.countRequest("incr", key, delta, initValue, expiration)
+	return c.countRequest(ctx, "incr", key, delta, initValue, expiration)
 }
 
-func (c *RawAsciiClient) Decrement(
+// Decrement implements the ContextClient interface.
+func (c *ContextRawAsciiClient) Decrement(
+	ctx context.Context,
 	key string,
 	delta uint64,
 	initValue uint64,
 	expiration uint32) CountResponse {
 
-	return c.countRequest("decr", key, delta, initValue, expiration)
+	return c.countRequest(ctx, "decr", key, delta, initValue, expiration)
 }
 
-func (c *RawAsciiClient) Flush(expiration uint32) Response {
+// Flush implements the ContextClient interface.
+func (c *ContextRawAsciiClient) Flush(ctx context.Context, expiration uint32) Response {
 	c.mutex.Lock()
 	defer c.mutex.Unlock()
+	c.channel.SetDeadlineFromContext(ctx)
 
 	err := c.writeStrings(
 		"flush_all ",
@@ -643,7 +686,8 @@ func (c *RawAsciiClient) Flush(expiration uint32) Response {
 	return NewResponse(StatusNoError)
 }
 
-func (c *RawAsciiClient) Stat(statsKey string) StatResponse {
+// Stat implements the ContextClient interface.
+func (c *ContextRawAsciiClient) Stat(ctx context.Context, statsKey string) StatResponse {
 	shardEntries := make(map[int](map[string]string))
 	entries := make(map[string]string)
 	shardEntries[c.ShardId()] = entries
@@ -658,6 +702,7 @@ func (c *RawAsciiClient) Stat(statsKey string) StatResponse {
 
 	c.mutex.Lock()
 	defer c.mutex.Unlock()
+	c.channel.SetDeadlineFromContext(ctx)
 
 	err = c.writeStrings("stats\r\n")
 	if err != nil {
@@ -697,11 +742,13 @@ func (c *RawAsciiClient) Stat(statsKey string) StatResponse {
 	return NewStatResponse(StatusNoError, shardEntries)
 }
 
-func (c *RawAsciiClient) Version() VersionResponse {
+// Version implements the ContextClient interface.
+func (c *ContextRawAsciiClient) Version(ctx context.Context) VersionResponse {
 	versions := make(map[int]string, 1)
 
 	c.mutex.Lock()
 	defer c.mutex.Unlock()
+	c.channel.SetDeadlineFromContext(ctx)
 
 	err := c.writeStrings("version\r\n")
 	if err != nil {
@@ -730,9 +777,11 @@ func (c *RawAsciiClient) Version() VersionResponse {
 	return NewVersionResponse(StatusNoError, versions)
 }
 
-func (c *RawAsciiClient) Verbosity(verbosity uint32) Response {
+// Verbosity implements the ContextClient interface.
+func (c *ContextRawAsciiClient) Verbosity(ctx context.Context, verbosity uint32) Response {
 	c.mutex.Lock()
 	defer c.mutex.Unlock()
+	c.channel.SetDeadlineFromContext(ctx)
 
 	err := c.writeStrings(
 		"verbosity ",

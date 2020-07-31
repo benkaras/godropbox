@@ -1,6 +1,7 @@
 package memcache
 
 import (
+	"context"
 	"errors"
 
 	. "gopkg.in/check.v1"
@@ -34,20 +35,35 @@ func (BadMemcacheConn) DiscardConnection() error {
 	return nil
 }
 
-// ShardedClientSuite
-type ShardedClientSuite struct {
+func (BadMemcacheConn) SetDeadlineFromContext(ctx context.Context) error {
+	return nil
+}
+
+// ShardedContextClientSuite
+type ShardedContextClientSuite struct {
 	sm *MockShardManager
-	mc Client
+	mc ContextClient
+}
+
+var _ = Suite(&ShardedContextClientSuite{})
+
+func (s *ShardedContextClientSuite) SetUpTest(c *C) {
+	s.sm = &MockShardManager{C: c}
+	s.mc = NewContextShardedClient(s.sm, NewContextRawBinaryClient)
+}
+
+type ShardedClientSuite struct {
+	ShardedContextClientSuite
 }
 
 var _ = Suite(&ShardedClientSuite{})
 
 func (s *ShardedClientSuite) SetUpTest(c *C) {
 	s.sm = &MockShardManager{C: c}
-	s.mc = NewShardedClient(s.sm, NewRawBinaryClient)
+	s.mc = newIgnoreContextClientAdapter(NewShardedClient(s.sm, NewRawBinaryClient))
 }
 
-func (s *ShardedClientSuite) TestSetSentinels(c *C) {
+func (s *ShardedContextClientSuite) TestSetSentinels(c *C) {
 	keys := []string{"key"}
 	items := []*Item{
 		{
@@ -67,7 +83,7 @@ func (s *ShardedClientSuite) TestSetSentinels(c *C) {
 		},
 	}
 
-	response := s.mc.SetSentinels(items)
+	response := s.mc.SetSentinels(context.Background(), items)
 	c.Assert(response, HasLen, 1)
 	c.Assert(response[0].Error(), IsNil)
 	c.Assert(response[0].DataVersionId(), Equals, uint64(0))
@@ -83,7 +99,7 @@ func (s *ShardedClientSuite) TestSetSentinels(c *C) {
 		},
 	}
 
-	response = s.mc.SetSentinels(items)
+	response = s.mc.SetSentinels(context.Background(), items)
 	c.Assert(response, HasLen, 1)
 	c.Assert(response[0].Error(), IsNil)
 	c.Assert(response[0].DataVersionId(), Equals, uint64(0))
@@ -98,7 +114,7 @@ func (s *ShardedClientSuite) TestSetSentinels(c *C) {
 		},
 	}
 
-	response = s.mc.SetSentinels(items)
+	response = s.mc.SetSentinels(context.Background(), items)
 	c.Assert(response, HasLen, 1)
 	c.Assert(response[0].Error(), NotNil)
 }
